@@ -2,6 +2,8 @@
 set -e
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+# bootstrap.sh exports PYTHON when Apple's python3 (3.9) is too old; honor it.
+PYTHON="${PYTHON:-python3}"
 CLAUDE_MD="$HOME/.claude/CLAUDE.md"
 TEMPLATE="$SCRIPT_DIR/claude-md-template.md"
 MARKER="CONTEXT-ORCHESTRATOR"
@@ -36,17 +38,17 @@ ok()   { echo "  ✓ $1"; }
 echo ""
 echo "Checking prerequisites..."
 
-if command -v python3 &>/dev/null; then
-    PY_VERSION=$(python3 -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")')
+if command -v "$PYTHON" &>/dev/null; then
+    PY_VERSION=$("$PYTHON" -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")')
     PY_MAJOR=$(echo "$PY_VERSION" | cut -d. -f1)
     PY_MINOR=$(echo "$PY_VERSION" | cut -d. -f2)
     if [ "$PY_MAJOR" -ge 3 ] && [ "$PY_MINOR" -ge 10 ]; then
-        ok "Python $PY_VERSION"
+        ok "Python $PY_VERSION ($PYTHON)"
     else
-        fail "Python $PY_VERSION too old. Need 3.10+."
+        fail "Python $PY_VERSION too old. Need 3.10+ (set PYTHON=/path/to/python3.12 or brew install python@3.12)."
     fi
 else
-    fail "python3 not on PATH. Install via Homebrew or python.org."
+    fail "$PYTHON not on PATH. Install via Homebrew (brew install python@3.12) or python.org."
 fi
 
 if command -v git &>/dev/null; then
@@ -73,7 +75,7 @@ echo ""
 # ---------------------------------------------------------------------------
 if [ ! -d "$SCRIPT_DIR/.venv" ]; then
     echo "Creating virtual environment..."
-    python3 -m venv "$SCRIPT_DIR/.venv"
+    "$PYTHON" -m venv "$SCRIPT_DIR/.venv"
 fi
 
 echo "Installing dependencies..."
@@ -144,13 +146,20 @@ if [ "$INSTALL_LAUNCHD" -eq 1 ]; then
 
     "$SCRIPT_DIR/.venv/bin/context-orchestrator-chroma" install
 
-    # Wait briefly for the daemon to come up, then verify.
-    for _ in 1 2 3 4 5 6 7 8 9 10; do
+    # Wait for the daemon to come up (a cold chroma start can take 20-30s on
+    # a slow disk / first import), then verify — failing loudly, with the log.
+    CHROMA_UP=0
+    for _ in $(seq 1 60); do
         if "$SCRIPT_DIR/.venv/bin/context-orchestrator-chroma" status >/dev/null 2>&1; then
-            break
+            CHROMA_UP=1; break
         fi
         sleep 1
     done
+    if [ "$CHROMA_UP" -ne 1 ]; then
+        echo "chroma daemon did not come up within 60s. Last log lines:"
+        tail -20 "$HOME/.context-orchestrator/chroma-daemon.log" 2>/dev/null || true
+        exit 1
+    fi
     "$SCRIPT_DIR/.venv/bin/context-orchestrator-chroma" status
 
     echo ""

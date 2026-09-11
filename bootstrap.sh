@@ -15,14 +15,22 @@
 
 set -uo pipefail
 
+# Non-interactive mode (CI, scripted installs): skip the Gemini prompt and the
+# permissions wait instead of trying to read a terminal that is not there.
+NONINTERACTIVE="${CONTORCH_NONINTERACTIVE:-0}"
+# Comma-separated components to skip, e.g. CONTORCH_SKIP=pipeline-monitor
+SKIP=",${CONTORCH_SKIP:-},"
+
 # ============================================================ config
 
 BASE_DIR="${BASE_DIR:-$HOME/tasks}"
 GEMINI_KEY_FILE="$HOME/.config/google/key"
 
-CONTEXT_ORCH_REPO="https://github.com/contorch/context-orchestrator.git"
-MEETING_CAPTURE_REPO="https://github.com/contorch/meeting-capture.git"
-PIPELINE_MONITOR_REPO="https://github.com/contorch/pipeline-monitor.git"
+# Overridable so CI can install from a local checkout / branch.
+CONTEXT_ORCH_REPO="${CONTEXT_ORCH_REPO:-https://github.com/contorch/context-orchestrator.git}"
+MEETING_CAPTURE_REPO="${MEETING_CAPTURE_REPO:-https://github.com/contorch/meeting-capture.git}"
+PIPELINE_MONITOR_REPO="${PIPELINE_MONITOR_REPO:-https://github.com/contorch/pipeline-monitor.git}"
+PY_FORMULA="python@3.12"
 
 CONTEXT_ORCH_DIR="$BASE_DIR/context-orchestrator"
 MEETING_CAPTURE_DIR="$BASE_DIR/meeting-capture"
@@ -36,6 +44,10 @@ if [ -t 1 ]; then
 else
     BOLD=''; RED=''; GREEN=''; YELLOW=''; BLUE=''; CYAN=''; DIM=''; RESET=''
 fi
+
+INCOMPLETE=""
+incomplete() { INCOMPLETE="${INCOMPLETE}  ✗ $1\n"; }
+skipped() { case "$SKIP" in *",$1,"*) return 0 ;; esac; return 1; }
 
 step()  { printf "\n${BOLD}${BLUE}▶ %s${RESET}\n" "$*"; }
 ok()    { printf "  ${GREEN}✓${RESET} %s\n" "$*"; }
@@ -85,6 +97,11 @@ check_xcode_clt() {
 }
 
 check_homebrew() {
+    if ! command -v brew >/dev/null 2>&1; then
+        for b in /opt/homebrew/bin/brew /usr/local/bin/brew; do
+            [ -x "$b" ] && eval "$("$b" shellenv)" && break
+        done
+    fi
     if command -v brew >/dev/null 2>&1; then
         ok "Homebrew installed"
     else
@@ -107,24 +124,25 @@ ensure_brew_pkg() {
     fi
 }
 
+py_ok() { "$1" -c 'import sys; sys.exit(0 if sys.version_info >= (3, 10) else 1)' 2>/dev/null; }
+py_ver() { "$1" -c 'import sys; print("%d.%d" % sys.version_info[:2])' 2>/dev/null || echo "none"; }
+
 check_python() {
     local py="${PYTHON:-python3}"
-    if ! command -v "$py" >/dev/null 2>&1; then
-        warn "python3 missing — installing python@3.10 via brew"
-        brew install python@3.10 >/dev/null 2>&1
+    if ! command -v "$py" >/dev/null 2>&1 || ! py_ok "$py"; then
+        warn "python3 $(py_ver "$py") is missing or older than 3.10 (Apple's CLT python is 3.9)"
+        info "installing $PY_FORMULA via brew…"
+        brew install "$PY_FORMULA" >/dev/null 2>&1 || fail "brew install $PY_FORMULA failed — run it by hand and re-run this script"
+        # Homebrew does not link a bare `python3` for versioned formulas, so the
+        # setup.sh scripts below would still find Apple's 3.9. Put the formula's
+        # unversioned symlinks first on PATH for the rest of this run.
+        local prefix; prefix="$(brew --prefix "$PY_FORMULA")"
+        export PATH="$prefix/libexec/bin:$PATH"
+        py="$prefix/libexec/bin/python3"
+        py_ok "$py" || fail "$py is not a working Python >= 3.10"
     fi
-    local v
-    v=$("$py" -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")')
-    case "$v" in
-        3.1[0-9]|3.[2-9][0-9])
-            ok "python $v"
-            ;;
-        *)
-            warn "python $v < 3.10 — installing python@3.10 via brew"
-            brew install python@3.10 >/dev/null 2>&1
-            ok "python@3.10 installed (use it via /opt/homebrew/opt/python@3.10/bin/python3.10)"
-            ;;
-    esac
+    export PYTHON="$py"
+    ok "python $(py_ver "$py") ($(command -v "$py"))"
 }
 
 check_claude_code() {
@@ -133,7 +151,8 @@ check_claude_code() {
     else
         warn "Claude Code not detected on PATH"
         info "Get it from claude.ai/download — re-run this script after install"
-        info "(continuing anyway; some steps may need a restart afterward)"
+        info "(continuing anyway; the MCP server will not be registered)"
+        incomplete "Claude Code not installed — install it, then re-run this script to register the MCP server + hook"
     fi
 }
 
@@ -142,17 +161,21 @@ check_claude_code() {
 clone_or_update() {
     local repo="$1" dir="$2" name="$3"
     if [ -d "$dir/.git" ]; then
-        info "git pull $name…"
+        info "git pull ${name}…"
         git -C "$dir" pull --quiet --ff-only 2>/dev/null && ok "$name up to date" || warn "$name has local changes — skipping pull"
     else
         mkdir -p "$(dirname "$dir")"
-        info "git clone $name…"
+        info "git clone ${name}…"
         git clone --quiet "$repo" "$dir" || fail "clone failed: $repo"
         ok "$name cloned to $dir"
     fi
 }
 
 # ============================================================ Gemini key
+
+# True only if we can actually read from the controlling terminal (a /dev/tty
+# node can exist and still be unopenable, e.g. under CI or a detached script).
+have_tty() { [ -t 0 ] || { [ -e /dev/tty ] && ( : < /dev/tty ) 2>/dev/null; }; }
 
 prompt_gemini_key() {
     if [ -f "$GEMINI_KEY_FILE" ] && [ -s "$GEMINI_KEY_FILE" ]; then
@@ -168,21 +191,26 @@ prompt_gemini_key() {
 
     cat <<EOF
 
-  ${CYAN}Gemini powers the better embeddings (3072d, much higher quality than the
-  default 384d local model) AND transcription in meeting-capture. It's optional
-  — skip with empty input and the pipeline runs entirely local.${RESET}
+  ${CYAN}Meeting transcription runs on Google's Gemini and needs an API key.
+  Skip it (empty input) and meeting-capture will record nothing until you add
+  one — notes, sources, and search still work, fully local. Gemini also
+  upgrades embeddings (3072d vs the default local 384d).${RESET}
 
-  Get a free key at: ${BOLD}https://aistudio.google.com/app/apikey${RESET}
-  Free tier covers ~all personal use.
+  Get a key at: ${BOLD}https://aistudio.google.com/apikey${RESET}
+  Add one later: write it to ~/.config/google/key (chmod 600) and re-run.
 
 EOF
+    local key=""
+    if [ "$NONINTERACTIVE" = 1 ] || ! have_tty; then
+        warn "no terminal to prompt on — skipping Gemini (write the key to $GEMINI_KEY_FILE later)"
+        return 1
+    fi
     ask "Paste your Gemini API key (or Enter to skip):"
-    local key
     if [ -t 0 ]; then
         read -r key
     else
         # piped install — read from /dev/tty
-        read -r key < /dev/tty
+        read -r key < /dev/tty || key=""
     fi
     if [ -z "$key" ]; then
         warn "skipped — Gemini features disabled (you can re-run later)"
@@ -220,6 +248,7 @@ setup_meeting_capture() {
             ok "meeting-capture setup complete"
         else
             warn "meeting-capture setup had errors — review output above"
+            incomplete "meeting-capture — re-run: bash $MEETING_CAPTURE_DIR/setup.sh"
         fi
     else
         warn "no setup.sh in meeting-capture — skipping (repo may need manual setup)"
@@ -237,9 +266,11 @@ setup_gemini() {
         else
             warn "Gemini activation had errors — re-run manually if needed:"
             warn "  cd $CONTEXT_ORCH_DIR && bash enable-gemini-pipeline.sh"
+            incomplete "Gemini activation — re-run: cd $CONTEXT_ORCH_DIR && bash enable-gemini-pipeline.sh"
         fi
     else
         skip "Gemini activation (no key)"
+        incomplete "meeting transcription is OFF until a Gemini key is at $GEMINI_KEY_FILE"
     fi
 }
 
@@ -250,51 +281,53 @@ setup_auto_context_hook() {
             ok "auto-context hook installed"
         else
             warn "hook install had errors — see above"
+            incomplete "auto-context hook — re-run: cd $CONTEXT_ORCH_DIR && bash install-claude-context.sh"
         fi
     else
         warn "install-claude-context.sh missing — skip (older context-orchestrator?)"
+        incomplete "auto-context hook (install-claude-context.sh missing)"
     fi
 }
 
 setup_pipeline_monitor() {
     step "[5/5] pipeline-monitor (menu bar dashboard)"
+    if skipped pipeline-monitor; then skip "pipeline-monitor (CONTORCH_SKIP)"; return 0; fi
     clone_or_update "$PIPELINE_MONITOR_REPO" "$PIPELINE_MONITOR_DIR" "pipeline-monitor"
     info "running install.sh --autostart…"
     if (cd "$PIPELINE_MONITOR_DIR" && bash install.sh --autostart 2>&1 | sed 's/^/    /'); then
         ok "pipeline-monitor installed and running (look for ○ in menu bar)"
     else
         warn "pipeline-monitor install had errors — see above"
+        incomplete "pipeline-monitor — re-run: cd $PIPELINE_MONITOR_DIR && bash install.sh --autostart"
     fi
 }
 
 # ============================================================ TCC permissions
 
 open_tcc_panes() {
-    step "Open System Settings → grant Microphone + Screen Recording"
-    info "The daemons just started via launchd; they've already tried to access"
-    info "the mic and the system-audio capture API. Their entries are now in the"
-    info "Privacy panes — toggled OFF. Just flip them ON."
+    step "Grant macOS permissions to sysaudio"
+    local bin="$MEETING_CAPTURE_DIR/bin/sysaudio"
+    info "Capture runs through one binary, ${BOLD}sysaudio${RESET}, and macOS attaches the"
+    info "permissions to it — grant them to sysaudio, not to your terminal."
     info ""
-    info "Opening Microphone pane…"
-    open "x-apple.systempreferences:com.apple.preference.security?Privacy_Microphone" 2>/dev/null || true
-    sleep 1
-    info "Opening Screen & System Audio Recording pane…"
-    open "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture" 2>/dev/null || true
+    info "1. System Settings → Privacy & Security → ${BOLD}Screen & System Audio Recording${RESET}"
+    info "   Click ＋, press ⌘⇧G, paste this path, add it, and enable it (also under"
+    info "   'System Audio Recording Only' if that list is shown):"
+    info "     $bin"
+    info "2. ${BOLD}Microphone${RESET} (macOS 15+): nothing to do now — the first real recording"
+    info "   pops a prompt for sysaudio; click Allow to get your own voice as 'Me'."
     info ""
-    info "Look for entries named ${BOLD}sysaudio${RESET} (Screen Recording) and"
-    info "${BOLD}meeting-capture${RESET} or ${BOLD}python3${RESET} (Microphone). Toggle each ON."
-    info ""
-    if [ -t 0 ] || [ -e /dev/tty ]; then
-        ask "Press Enter once you've toggled both ON (or Ctrl-C to skip):"
-        if [ -t 0 ]; then read -r _; else read -r _ < /dev/tty; fi
-    else
-        warn "non-interactive shell — skipping the wait. Toggle them when you can."
+    if [ "$NONINTERACTIVE" = 1 ] || ! have_tty; then
+        warn "non-interactive — not opening System Settings. Grant the permission above before your first call."
+        incomplete "Screen & System Audio Recording grant for $bin (System Settings → Privacy & Security)"
+        return 0
     fi
-    # After granting, bounce the daemons so they pick up the new permissions.
-    info "Restarting daemons so they pick up the new grants…"
-    for label in com.contorch.meeting-capture com.contorch.transcript-watcher; do
-        launchctl kickstart -k "gui/$(id -u)/$label" 2>/dev/null && ok "kicked $label" || true
-    done
+    info "Opening the Screen & System Audio Recording pane…"
+    open "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture" 2>/dev/null || true
+    ask "Press Enter once sysaudio is added and enabled (or Ctrl-C to do it later):"
+    if [ -t 0 ]; then read -r _; else read -r _ < /dev/tty || true; fi
+    # Bounce the capture daemon so it picks up the grant.
+    launchctl kickstart -k "gui/$(id -u)/com.contorch.meeting-capture" 2>/dev/null && ok "restarted meeting-capture" || true
 }
 
 # ============================================================ final report
@@ -302,16 +335,14 @@ open_tcc_panes() {
 final_report() {
     cat <<EOF
 
-${BOLD}${GREEN}╭──────────────────────────────────────────────────────╮
-│  ✓ Bootstrap complete                                │
-╰──────────────────────────────────────────────────────╯${RESET}
+$( if [ -z "$INCOMPLETE" ]; then printf "%b" "${BOLD}${GREEN}╭──────────────────────────────────────────────────────╮\n│  ✓ Bootstrap complete                                │\n╰──────────────────────────────────────────────────────╯${RESET}"; else printf "%b" "${BOLD}${YELLOW}╭──────────────────────────────────────────────────────╮\n│  ! Bootstrap finished with things left to do         │\n╰──────────────────────────────────────────────────────╯${RESET}\n\n${BOLD}Not done yet:${RESET}\n${INCOMPLETE}"; fi )
 
 ${BOLD}Installed at:${RESET}
   $CONTEXT_ORCH_DIR
   $MEETING_CAPTURE_DIR
   $PIPELINE_MONITOR_DIR
 
-${BOLD}${YELLOW}One thing left for you:${RESET}
+${BOLD}${YELLOW}Then:${RESET}
 
   ${CYAN}▶${RESET} ${BOLD}Restart Claude Code${RESET}
        Quit and relaunch the app so it picks up the new MCP server +
@@ -339,8 +370,6 @@ main() {
     check_xcode_clt
     check_homebrew
     ensure_brew_pkg git
-    ensure_brew_pkg node npm
-    ensure_brew_pkg gh
     check_python
     check_claude_code
 
@@ -353,8 +382,9 @@ main() {
     open_tcc_panes
 
     final_report
+    [ -z "$INCOMPLETE" ]
 }
 
-if [ "${BASH_SOURCE[0]}" = "${0}" ] || [ -z "${BASH_SOURCE[0]:-}" ]; then
+if [ "${BASH_SOURCE[0]:-}" = "${0}" ] || [ -z "${BASH_SOURCE[0]:-}" ]; then
     main "$@"
 fi

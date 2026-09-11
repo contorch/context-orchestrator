@@ -1,0 +1,86 @@
+name: install-smoke
+
+# Runs the public install path the way a user hits it: contorch.com/install is
+# `exec /bin/bash -c "$(curl … bootstrap.sh)"`, i.e. macOS's bash 3.2, script
+# arriving as a -c string, UTF-8 locale, no controlling terminal. Two of the
+# bugs that broke the install for months (an unbound BASH_SOURCE under set -u,
+# and bash 3.2 parsing "$name…" as one identifier in a UTF-8 locale) only show
+# up in exactly this mode — `bash -n` and running the file directly both pass.
+#
+# Installs from THIS checkout (CONTEXT_ORCH_REPO) so the PR's own setup.sh is
+# exercised; meeting-capture and pipeline-monitor come from their main branches.
+
+on:
+  pull_request:
+    paths: ["bootstrap.sh", "setup.sh", "install-claude-context.sh", "enable-gemini-pipeline.sh", "src/**", "pyproject.toml", ".github/workflows/install-smoke.yml"]
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  lint:
+    runs-on: macos-15
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - name: bash 3.2 parse + bash>=4-only syntax + multibyte-glued variables
+        run: |
+          set -euo pipefail
+          /bin/bash --version | head -1
+          for f in bootstrap.sh setup.sh install-claude-context.sh enable-gemini-pipeline.sh; do /bin/bash -n "$f"; done
+          ! grep -nE 'mapfile|readarray|declare -A|\$\{[a-zA-Z_]+(,,|\^\^)|&>>|\[\[ -v|read -i|coproc' bootstrap.sh setup.sh install-claude-context.sh enable-gemini-pipeline.sh
+          # "$name…" — bash 3.2 in a UTF-8 locale reads the ellipsis as part of the name
+          ! grep -nP '\$[A-Za-z_][A-Za-z0-9_]*[^\x00-\x7F]' bootstrap.sh setup.sh install-claude-context.sh enable-gemini-pipeline.sh
+      - name: entry guard survives bash -c and a pipe under set -u
+        run: |
+          set -euo pipefail
+          # Prove main() is reached in both delivery modes without running the installer:
+          # replace main's body with a marker, keep everything else verbatim.
+          sed 's/^main() {$/main() { echo MAIN_REACHED; return 0; }; _unused() {/' bootstrap.sh > /tmp/guard.sh
+          LANG=en_US.UTF-8 /bin/bash -c "$(cat /tmp/guard.sh)" | grep -q MAIN_REACHED
+          LANG=en_US.UTF-8 cat /tmp/guard.sh | /bin/bash | grep -q MAIN_REACHED
+
+  install:
+    runs-on: macos-15
+    timeout-minutes: 30
+    needs: lint
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run bootstrap exactly as the shim does
+        env:
+          LANG: en_US.UTF-8
+          LC_ALL: en_US.UTF-8
+          CONTORCH_NONINTERACTIVE: "1"
+          CONTORCH_SKIP: pipeline-monitor      # a menu-bar app has no place on a runner
+          CONTEXT_ORCH_REPO: ${{ github.workspace }}
+          BASE_DIR: /Users/runner/contorch-ci
+        run: |
+          set -o pipefail
+          /bin/bash -c "$(cat bootstrap.sh)" 2>&1 | tee /tmp/bootstrap.log
+          status=${PIPESTATUS[0]}
+          # Non-interactive runs legitimately end with "things left to do" (Gemini key,
+          # TCC grant, Claude Code absent) → exit 1. Anything else is a real failure.
+          if [ "$status" -ne 0 ]; then
+            grep -q "Bootstrap finished with things left to do" /tmp/bootstrap.log || { echo "bootstrap failed (exit $status)"; exit 1; }
+          fi
+      - name: Assert what a user would have on disk
+        run: |
+          set -euo pipefail
+          B=/Users/runner/contorch-ci
+          test -x "$B/context-orchestrator/.venv/bin/context-orchestrator-chroma"
+          test -x "$B/context-orchestrator/.venv/bin/transcript-watcher"
+          test -x "$B/meeting-capture/.venv/bin/meeting-capture"
+          test -x "$B/meeting-capture/bin/sysaudio"
+          test -f "$HOME/Library/LaunchAgents/com.contorch.context-orchestrator-chroma.plist"
+          test -f "$HOME/Library/LaunchAgents/com.contorch.transcript-watcher.plist"
+          test -f "$HOME/Library/LaunchAgents/com.contorch.meeting-capture.plist"
+          test -x "$HOME/.claude/hooks/auto-context.py"
+          python3 -c "import json; h=json.load(open('$HOME/.claude/settings.json'))['hooks']['UserPromptSubmit']; assert h, 'hook not wired'"
+          curl -fsS http://127.0.0.1:8765/api/v2/heartbeat
+          "$B/context-orchestrator/.venv/bin/transcript-watcher" doctor
+          "$B/meeting-capture/.venv/bin/meeting-capture" doctor || true   # TCC grants can't exist on a runner
+          grep -q "Not done yet" /tmp/bootstrap.log && grep -A6 "Not done yet" /tmp/bootstrap.log
+      - name: Upload log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with: { name: bootstrap-log, path: /tmp/bootstrap.log }
