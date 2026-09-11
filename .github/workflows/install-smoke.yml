@@ -55,9 +55,13 @@ jobs:
           CONTEXT_ORCH_REPO: ${{ github.workspace }}
           BASE_DIR: /Users/runner/contorch-ci
         run: |
-          set -o pipefail
-          /bin/bash -c "$(cat bootstrap.sh)" 2>&1 | tee /tmp/bootstrap.log
-          status=${PIPESTATUS[0]}
+          # GitHub runs this step under `bash -eo pipefail`; a non-zero bootstrap
+          # exit must not abort the step before we can inspect why it was non-zero.
+          set +e
+          /bin/bash -c "$(cat bootstrap.sh)" > /tmp/bootstrap.log 2>&1
+          status=$?
+          set -e
+          cat /tmp/bootstrap.log
           # Non-interactive runs legitimately end with "things left to do" (Gemini key,
           # TCC grant, Claude Code absent) → exit 1. Anything else is a real failure.
           if [ "$status" -ne 0 ]; then
