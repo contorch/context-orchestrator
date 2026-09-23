@@ -1,6 +1,6 @@
 [project]
 name = "context-orchestrator"
-version = "0.1.0"
+version = "0.2.0"
 description = "Task-aware context management MCP server for LLMs"
 requires-python = ">=3.10"
 dependencies = [
@@ -13,6 +13,9 @@ dependencies = [
 save-transcript = "context_orchestrator.cli:main"
 transcript-watcher = "context_orchestrator.watcher:main"
 context-orchestrator-chroma = "context_orchestrator.chroma_daemon:main"
+# The MCP server as a real executable, so a packaged install (Homebrew) can
+# register one stable path with `claude mcp add` instead of python -m + PYTHONPATH.
+contorch-mcp = "context_orchestrator.server:main"
 
 [project.optional-dependencies]
 dev = ["pytest>=7.0"]
