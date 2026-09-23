@@ -11,6 +11,7 @@ from mcp.server.fastmcp import FastMCP
 from context_orchestrator.db import Database
 from context_orchestrator.search import VectorSearch
 from context_orchestrator.ingest import index_file_content
+from context_orchestrator.watcher import catch_up as _catch_up_transcripts
 
 # How long after a meeting transcript was last touched do we still auto-link new sources to it?
 RECENT_MEETING_WINDOW_SECONDS = 10 * 60
@@ -130,11 +131,37 @@ def _sync_index():
     logger.info(f"Synced {indexed} documents to vector index")
 
 
+# Transcripts are indexed on demand — there is no watcher daemon by default.
+# At most one catch-up per CATCH_UP_EVERY_S from search(), plus one at startup.
+CATCH_UP_EVERY_S = 30.0
+_last_catch_up = 0.0
+
+
+def _index_new_transcripts(force: bool = False) -> None:
+    global _last_catch_up
+    now = time.monotonic()
+    if not force and now - _last_catch_up < CATCH_UP_EVERY_S:
+        return
+    _last_catch_up = now
+    try:
+        indexed = _catch_up_transcripts(vs)
+        if indexed:
+            logger.info("indexed %d new/changed transcript(s): %s",
+                        len(indexed), ", ".join(p.name for p in indexed))
+    except Exception:
+        logger.exception("transcript catch-up failed")
+
+
+def _startup_sync() -> None:
+    _sync_index()
+    _index_new_transcripts(force=True)
+
+
 @asynccontextmanager
 async def _lifespan(app: FastMCP):
     """Run the index sync in a background thread so the server starts accepting connections immediately."""
     async with anyio.create_task_group() as tg:
-        tg.start_soon(anyio.to_thread.run_sync, _sync_index)
+        tg.start_soon(anyio.to_thread.run_sync, _startup_sync)
         yield
         tg.cancel_scope.cancel()
 
@@ -485,6 +512,9 @@ def search(
     metadata `where` clause — they constrain the dense retriever. When any
     filter is specified, hybrid mode is disabled (BM25 is unfiltered).
     """
+    # Pick up meetings that ended since the last look. Never blocks behind
+    # another process's indexing run (catch_up returns immediately then).
+    _index_new_transcripts()
     vs.reload()  # pick up writes from the watcher / other processes
 
     # Build metadata filter

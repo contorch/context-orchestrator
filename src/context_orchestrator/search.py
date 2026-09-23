@@ -131,10 +131,20 @@ def _build_embedding_function():
     # trust_remote_code is required for nomic-embed and similar custom-arch
     # models. It's safe here because the model name is user-controlled and
     # they explicitly opted in via env var.
-    return SentenceTransformerEmbeddingFunction(
-        model_name=model_name,
-        trust_remote_code=True,
-    )
+    try:
+        return SentenceTransformerEmbeddingFunction(
+            model_name=model_name,
+            trust_remote_code=True,
+        )
+    except ValueError as e:
+        # Newer chromadb imports sentence_transformers lazily and raises
+        # ValueError at construction rather than ImportError at import.
+        if "sentence_transformers" not in str(e):
+            raise
+        raise RuntimeError(
+            f"{EMBEDDING_MODEL_ENV}={model_name} requires the 'embeddings' "
+            "extra. Install with: pip install -e '.[embeddings]'"
+        ) from e
 
 
 def _build_gemini_embedding_function(model_name: str):

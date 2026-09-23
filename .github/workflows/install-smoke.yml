@@ -18,6 +18,18 @@ on:
   workflow_dispatch:
 
 jobs:
+  tests:
+    runs-on: macos-15
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
+      - name: pytest
+        run: |
+          python -m pip install -q -e '.[dev]'
+          python -m pytest -q tests
+
   lint:
     runs-on: macos-15
     timeout-minutes: 5
@@ -76,7 +88,8 @@ jobs:
           test -x "$B/meeting-capture/.venv/bin/meeting-capture"
           test -x "$B/meeting-capture/bin/sysaudio"
           test -f "$HOME/Library/LaunchAgents/com.contorch.context-orchestrator-chroma.plist"
-          test -f "$HOME/Library/LaunchAgents/com.contorch.transcript-watcher.plist"
+          # Daemon-free indexing: the watcher agent must NOT be installed.
+          test ! -f "$HOME/Library/LaunchAgents/com.contorch.transcript-watcher.plist"
           test -f "$HOME/Library/LaunchAgents/com.contorch.meeting-capture.plist"
           test -x "$HOME/.claude/hooks/auto-context.py"
           python3 -c "import json; h=json.load(open('$HOME/.claude/settings.json'))['hooks']['UserPromptSubmit']; assert h, 'hook not wired'"
@@ -90,10 +103,17 @@ jobs:
           # Files on disk and a green doctor are not the product; Claude talking
           # to the server is. A fresh resolve of mcp 2.x once crashed it on import.
           B=/Users/runner/contorch-ci/context-orchestrator
+          # A finished meeting (older than the 60s settle window) that no daemon
+          # has indexed: the server must find it on its own, on demand.
+          mkdir -p "$HOME/transcripts"
+          T="$HOME/transcripts/meeting-2026-01-01T10-00-00.md"
+          printf '# Meeting transcript\n\n**Them:** the zebra migration ships on Thursday behind the kiwi flag\n' > "$T"
+          touch -t 202601011000 "$T"
           { printf '%s\n' \
               '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"ci","version":"0"}}}' \
               '{"jsonrpc":"2.0","method":"notifications/initialized"}' \
-              '{"jsonrpc":"2.0","id":2,"method":"tools/list"}'; sleep 20; } \
+              '{"jsonrpc":"2.0","id":2,"method":"tools/list"}'; sleep 45; \
+            printf '%s\n' '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"search","arguments":{"query":"when does the zebra migration ship"}}}'; sleep 45; } \
             | PYTHONPATH="$B/src" "$B/.venv/bin/python" -m context_orchestrator.server > /tmp/mcp.out 2> /tmp/mcp.err || true
           python3 - <<'PYEOF'
           import json, sys
@@ -105,11 +125,23 @@ jobs:
                   continue
               if m.get("id") == 2:
                   tools = [t["name"] for t in m["result"]["tools"]]
+          found = None
+          for line in open("/tmp/mcp.out"):
+              try:
+                  m = json.loads(line)
+              except ValueError:
+                  continue
+              if m.get("id") == 3:
+                  found = json.dumps(m.get("result", m))
           if not tools:
               print(open("/tmp/mcp.err").read()[-3000:])
               sys.exit("MCP server did not answer tools/list")
           print(len(tools), "tools:", ", ".join(tools))
           assert "search" in tools, "search tool missing"
+          if not found or "zebra" not in found:
+              print((found or "no search reply")[:2000]); print(open("/tmp/mcp.err").read()[-3000:])
+              sys.exit("on-demand indexing: search did not find the un-indexed transcript")
+          print("on-demand indexing: search found the transcript with no watcher daemon running")
           PYEOF
       - name: Upload log
         if: always()

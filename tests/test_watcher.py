@@ -128,3 +128,44 @@ def test_main_no_subcommand_defaults_to_run(monkeypatch):
         pass
     assert called["watch_dir"] == watcher.TRANSCRIPT_DIR
     assert called["interval"] == watcher.DEFAULT_INTERVAL
+
+
+# ---- on-demand indexing (catch_up) — the default, daemon-free path
+
+def test_catch_up_indexes_and_persists_state(vs, watch_dir, state_file, tmp_path):
+    _write_old(watch_dir / "meeting-a.md", "# Meeting\n**Them:** ship the retry fix behind a flag")
+    lock = tmp_path / "index.lock"
+    indexed = watcher.catch_up(vs, watch_dir, state_file, lock_file=lock)
+    assert [p.name for p in indexed] == ["meeting-a.md"]
+    assert str(watch_dir / "meeting-a.md") in json.loads(state_file.read_text())
+    # Second pass: nothing new.
+    assert watcher.catch_up(vs, watch_dir, state_file, lock_file=lock) == []
+
+
+def test_catch_up_returns_none_while_another_process_indexes(vs, watch_dir, state_file, tmp_path):
+    import fcntl
+    _write_old(watch_dir / "meeting-b.md", "# Meeting\n**Me:** hello")
+    lock = tmp_path / "index.lock"
+    with open(lock, "a") as held:
+        fcntl.flock(held, fcntl.LOCK_EX)          # "another MCP server" is indexing
+        assert watcher.catch_up(vs, watch_dir, state_file, lock_file=lock) is None
+    # Lock released → this process picks it up.
+    assert [p.name for p in watcher.catch_up(vs, watch_dir, state_file, lock_file=lock)] == ["meeting-b.md"]
+
+
+def test_catch_up_rereads_state_written_by_another_process(vs, watch_dir, state_file, tmp_path):
+    f = watch_dir / "meeting-c.md"
+    _write_old(f, "# Meeting\n**Them:** already handled elsewhere")
+    watcher.save_state({str(f): f.stat().st_mtime}, state_file)   # someone else indexed it
+    assert watcher.catch_up(vs, watch_dir, state_file, lock_file=tmp_path / "l") == []
+
+
+def test_catch_up_skips_a_meeting_still_being_written(vs, watch_dir, state_file, tmp_path):
+    (watch_dir / "meeting-live.md").write_text("# Meeting\n**Me:** still talking")
+    assert watcher.catch_up(vs, watch_dir, state_file, lock_file=tmp_path / "l") == []
+
+
+def test_save_state_is_atomic_and_leaves_no_tmp(state_file):
+    watcher.save_state({"a": 1.0}, state_file)
+    assert json.loads(state_file.read_text()) == {"a": 1.0}
+    assert list(state_file.parent.glob("*.tmp")) == []
