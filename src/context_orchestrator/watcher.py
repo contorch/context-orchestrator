@@ -1,4 +1,10 @@
-"""Polls ~/transcripts/ for new or modified .md files and reindexes them.
+"""Indexes new or modified .md files in ~/transcripts/.
+
+Two ways in, one implementation (`catch_up`):
+  * on demand — the MCP server calls catch_up() when Claude Code starts it and
+    before searches. This is the default: no background daemon.
+  * `transcript-watcher run` — the old always-on poll loop, still available
+    for anyone who wants it (and `install` still writes its launchd agent).
 
 Designed to pair with meeting-capture (https://github.com/contorch/meeting-capture),
 which writes transcripts continuously while a meeting runs. Files get appended to
@@ -23,6 +29,9 @@ TRANSCRIPT_DIR = Path.home() / "transcripts"
 STATE_DIR = Path.home() / ".context-orchestrator"
 STATE_FILE = STATE_DIR / "watcher_state.json"
 LOG_FILE = STATE_DIR / "watcher.log"
+# Serialises indexing across processes: several Claude Code sessions each run
+# their own MCP server, and an old watcher agent may still be around.
+LOCK_FILE = STATE_DIR / "index.lock"
 DEFAULT_INTERVAL = 5.0
 # How long a file must be quiet (no mtime advance) before we re-index it.
 #
@@ -58,7 +67,10 @@ def load_state(state_file: Path = STATE_FILE) -> dict[str, float]:
 
 def save_state(state: dict[str, float], state_file: Path = STATE_FILE) -> None:
     state_file.parent.mkdir(parents=True, exist_ok=True)
-    state_file.write_text(json.dumps(state, indent=2, sort_keys=True))
+    # Atomic: another process may read it at any moment.
+    tmp = state_file.with_suffix(f".{os.getpid()}.tmp")
+    tmp.write_text(json.dumps(state, indent=2, sort_keys=True))
+    os.replace(tmp, state_file)
 
 
 def scan_once(
@@ -100,21 +112,49 @@ def scan_once(
     return indexed
 
 
+def catch_up(
+    vs: VectorSearch,
+    watch_dir: Path = TRANSCRIPT_DIR,
+    state_file: Path = STATE_FILE,
+    settle_seconds: float = SETTLE_SECONDS,
+    lock_file: Path = LOCK_FILE,
+) -> list[Path] | None:
+    """One indexing pass that is safe to run from several processes at once.
+
+    Returns the files indexed, or None if another process is already indexing
+    (the caller just proceeds with the index as it is — it never waits).
+    State is re-read inside the lock because another process may have
+    advanced it since we last looked.
+    """
+    import fcntl
+
+    lock_file.parent.mkdir(parents=True, exist_ok=True)
+    with open(lock_file, "a") as fh:
+        try:
+            fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return None
+        try:
+            state = load_state(state_file)
+            indexed = scan_once(vs, watch_dir, state, settle_seconds)
+            if indexed:
+                save_state(state, state_file)
+            return indexed
+        finally:
+            fcntl.flock(fh, fcntl.LOCK_UN)
+
+
 def watch_loop(
     watch_dir: Path = TRANSCRIPT_DIR,
     interval: float = DEFAULT_INTERVAL,
     state_file: Path = STATE_FILE,
 ) -> None:
     vs = VectorSearch()
-    state = load_state(state_file)
     log.info("watching %s every %.1fs", watch_dir, interval)
     while True:
         try:
-            indexed = scan_once(vs, watch_dir, state)
-            if indexed:
-                save_state(state, state_file)
-                for p in indexed:
-                    log.info("indexed %s", p.name)
+            for p in catch_up(vs, watch_dir, state_file) or []:
+                log.info("indexed %s", p.name)
         except Exception:
             log.exception("scan failed")
         time.sleep(interval)
@@ -144,11 +184,11 @@ def cmd_run(args) -> int:
 
 def cmd_once(args) -> int:
     vs = VectorSearch()
-    state = load_state()
-    indexed = scan_once(vs, Path(args.dir).expanduser(), state)
-    if indexed:
-        save_state(state)
-    log.info("indexed %d file(s)", len(indexed))
+    indexed = catch_up(vs, Path(args.dir).expanduser())
+    if indexed is None:
+        log.info("another process is indexing right now — nothing to do")
+    else:
+        log.info("indexed %d file(s)", len(indexed))
     return 0
 
 
@@ -260,7 +300,8 @@ def cmd_doctor(_args) -> int:
         else:
             _fail("launchd service not loaded", f"launchctl load -w {LAUNCHD_PLIST}")
     else:
-        _fail("launchd plist not installed", "transcript-watcher install")
+        _ok("no watcher daemon (default)",
+            "transcripts are indexed on demand by the MCP server; `transcript-watcher install` for always-on")
 
     print("\nUpstream (meeting-capture):")
     mc_log = Path.home() / ".meeting-capture" / "daemon.log"
@@ -294,7 +335,7 @@ def main(argv: list[str] | None = None) -> int:
     p_run.add_argument("--interval", type=float, default=DEFAULT_INTERVAL)
     p_run.set_defaults(func=cmd_run)
 
-    p_once = sub.add_parser("once", help="scan once and exit (for cron)")
+    p_once = sub.add_parser("once", help="index anything new once and exit")
     p_once.add_argument("--dir", default=str(TRANSCRIPT_DIR))
     p_once.set_defaults(func=cmd_once)
 

@@ -162,9 +162,13 @@ if [ "$INSTALL_LAUNCHD" -eq 1 ]; then
     fi
     "$SCRIPT_DIR/.venv/bin/context-orchestrator-chroma" status
 
-    echo ""
-    echo "Installing transcript-watcher launchd agent..."
-    "$SCRIPT_DIR/.venv/bin/transcript-watcher" install
+    # No watcher daemon: the MCP server indexes new transcripts on demand.
+    # Retire an agent left by an older install.
+    if [ -f "$HOME/Library/LaunchAgents/com.contorch.transcript-watcher.plist" ]; then
+        echo ""
+        echo "Removing the old transcript-watcher daemon (indexing is on demand now)..."
+        "$SCRIPT_DIR/.venv/bin/transcript-watcher" uninstall || true
+    fi
 else
     echo ""
     echo "Skipping launchd install (--no-launchd flag)."
