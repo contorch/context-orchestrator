@@ -1,10 +1,12 @@
 [project]
 name = "context-orchestrator"
-version = "0.2.0"
+version = "0.2.1"
 description = "Task-aware context management MCP server for LLMs"
 requires-python = ">=3.10"
 dependencies = [
-    "mcp[cli]>=1.0.0",
+    # mcp 2.x renamed FastMCP → MCPServer and changed APIs; a fresh install
+    # resolved 2.x and the server died on import. Pin until server.py is ported.
+    "mcp[cli]>=1.0.0,<2",
     "chromadb>=0.5.0",
     "rank-bm25>=0.2.2",
 ]
