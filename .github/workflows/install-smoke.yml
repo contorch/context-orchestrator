@@ -84,6 +84,33 @@ jobs:
           "$B/context-orchestrator/.venv/bin/transcript-watcher" doctor
           "$B/meeting-capture/.venv/bin/meeting-capture" doctor || true   # TCC grants can't exist on a runner
           grep -q "Not done yet" /tmp/bootstrap.log && grep -A6 "Not done yet" /tmp/bootstrap.log
+      - name: The MCP server Claude Code will launch actually answers
+        run: |
+          set -euo pipefail
+          # Files on disk and a green doctor are not the product; Claude talking
+          # to the server is. A fresh resolve of mcp 2.x once crashed it on import.
+          B=/Users/runner/contorch-ci/context-orchestrator
+          { printf '%s\n' \
+              '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"ci","version":"0"}}}' \
+              '{"jsonrpc":"2.0","method":"notifications/initialized"}' \
+              '{"jsonrpc":"2.0","id":2,"method":"tools/list"}'; sleep 20; } \
+            | PYTHONPATH="$B/src" "$B/.venv/bin/python" -m context_orchestrator.server > /tmp/mcp.out 2> /tmp/mcp.err || true
+          python3 - <<'PYEOF'
+          import json, sys
+          tools = None
+          for line in open("/tmp/mcp.out"):
+              try:
+                  m = json.loads(line)
+              except ValueError:
+                  continue
+              if m.get("id") == 2:
+                  tools = [t["name"] for t in m["result"]["tools"]]
+          if not tools:
+              print(open("/tmp/mcp.err").read()[-3000:])
+              sys.exit("MCP server did not answer tools/list")
+          print(len(tools), "tools:", ", ".join(tools))
+          assert "search" in tools, "search tool missing"
+          PYEOF
       - name: Upload log
         if: always()
         uses: actions/upload-artifact@v4
