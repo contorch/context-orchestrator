@@ -1,4 +1,5 @@
-"""Indexes new or modified .md files in ~/transcripts/.
+"""Keeps the transcript index current: imports .md files dropped in
+~/transcripts/ into the database and indexes changed transcripts.
 
 Two ways in, one implementation (`catch_up`):
   * on demand — the MCP server calls catch_up() when Claude Code starts it and
@@ -20,9 +21,10 @@ import plistlib
 import subprocess
 import sys
 import time
+from datetime import datetime
 from pathlib import Path
 
-from .cli import index_transcript
+from . import transcripts
 from .search import VectorSearch
 
 TRANSCRIPT_DIR = Path.home() / "transcripts"
@@ -78,38 +80,48 @@ def scan_once(
     watch_dir: Path,
     state: dict[str, float],
     settle_seconds: float = SETTLE_SECONDS,
-) -> list[Path]:
-    """Reindex any .md file in watch_dir whose mtime has advanced.
+    db=None,
+) -> list[str]:
+    """Import any settled .md in watch_dir into the database, then index every
+    transcript in the database that changed. Returns the meeting ids indexed.
 
-    Files modified within the last `settle_seconds` are skipped on this pass to
-    avoid indexing mid-write. They'll be picked up on the next scan.
+    Transcripts live in the database now; the folder is only an inbox for
+    older meeting-capture versions and `save-transcript`-style drops. Files are
+    imported (replacing the stored text for that meeting, since an older
+    meeting-capture keeps appending to the same file) but never deleted here:
+    `contorch-transcripts import ~/transcripts --delete` does that once.
     """
-    if not watch_dir.exists():
-        return []
+    db = db if db is not None else _default_db()
     now = time.time()
-    indexed: list[Path] = []
-    for f in sorted(watch_dir.glob("*.md")):
-        try:
-            mtime = f.stat().st_mtime
-        except FileNotFoundError:
-            continue
-        key = str(f)
-        if mtime <= state.get(key, 0.0):
-            continue
-        if (now - mtime) < settle_seconds:
-            continue
-        try:
-            vs.collection.delete(where={"file_path": key})
-        except Exception:
-            log.exception("failed to clear old chunks for %s", key)
-        try:
-            index_transcript(vs, f)
-        except Exception:
-            log.exception("failed to index %s", key)
-            continue
-        state[key] = mtime
-        indexed.append(f)
-    return indexed
+    if watch_dir.exists():
+        for f in sorted(watch_dir.glob("*.md")):
+            try:
+                mtime = f.stat().st_mtime
+            except FileNotFoundError:
+                continue
+            key = str(f)
+            if mtime <= state.get(key, 0.0) or (now - mtime) < settle_seconds:
+                continue
+            try:
+                text = f.read_text(encoding="utf-8")
+                transcripts.add_file_text(db, f.name, text,
+                                          datetime.fromtimestamp(mtime), source="file")
+            except Exception:
+                log.exception("failed to import %s", key)
+                continue
+            state[key] = mtime
+    return transcripts.index_pending(vs, db, settle_seconds=settle_seconds, now=now)
+
+
+_db = None
+
+
+def _default_db():
+    global _db
+    if _db is None:
+        from .db import Database
+        _db = Database()
+    return _db
 
 
 def catch_up(
@@ -118,12 +130,14 @@ def catch_up(
     state_file: Path = STATE_FILE,
     settle_seconds: float = SETTLE_SECONDS,
     lock_file: Path = LOCK_FILE,
-) -> list[Path] | None:
-    """One indexing pass that is safe to run from several processes at once.
+    db=None,
+) -> list[str] | None:
+    """One import + indexing pass that is safe to run from several processes
+    at once.
 
-    Returns the files indexed, or None if another process is already indexing
-    (the caller just proceeds with the index as it is — it never waits).
-    State is re-read inside the lock because another process may have
+    Returns the meeting ids indexed, or None if another process is already
+    indexing (the caller just proceeds with the index as it is — it never
+    waits). State is re-read inside the lock because another process may have
     advanced it since we last looked.
     """
     import fcntl
@@ -136,8 +150,9 @@ def catch_up(
             return None
         try:
             state = load_state(state_file)
-            indexed = scan_once(vs, watch_dir, state, settle_seconds)
-            if indexed:
+            before = dict(state)
+            indexed = scan_once(vs, watch_dir, state, settle_seconds, db=db)
+            if state != before:
                 save_state(state, state_file)
             return indexed
         finally:
@@ -153,8 +168,8 @@ def watch_loop(
     log.info("watching %s every %.1fs", watch_dir, interval)
     while True:
         try:
-            for p in catch_up(vs, watch_dir, state_file) or []:
-                log.info("indexed %s", p.name)
+            for mid in catch_up(vs, watch_dir, state_file) or []:
+                log.info("indexed %s", mid)
         except Exception:
             log.exception("scan failed")
         time.sleep(interval)
@@ -253,11 +268,17 @@ def cmd_doctor(_args) -> int:
     print("transcript-watcher — doctor\n")
 
     print("Paths:")
+    try:
+        total, pending = _default_db().count_transcripts()
+        _ok("transcripts database", f"{total} transcript(s), {pending} waiting to be indexed")
+    except Exception as exc:
+        _fail(f"transcripts database unreadable: {exc}", "check ~/.context-orchestrator/context.db")
     if TRANSCRIPT_DIR.exists():
         n = len(list(TRANSCRIPT_DIR.glob("*.md")))
-        _ok("watch dir", f"{TRANSCRIPT_DIR} ({n} files)")
+        print(f"  · {TRANSCRIPT_DIR} has {n} .md file(s) — imported into the database on the next search; "
+              f"`contorch-transcripts import {TRANSCRIPT_DIR} --delete` moves them in and removes the files")
     else:
-        _fail("watch dir missing", f"mkdir -p {TRANSCRIPT_DIR}")
+        _ok("no transcript files", "transcripts live in the database")
     if STATE_DIR.exists():
         _ok("state dir", str(STATE_DIR))
     else:

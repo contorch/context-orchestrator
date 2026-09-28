@@ -1,0 +1,235 @@
+"""Transcripts stored in SQLite, indexed into Chroma, no files involved."""
+import datetime as dt
+import io
+import json
+import tempfile
+import time
+import zipfile
+from pathlib import Path
+
+import pytest
+
+from context_orchestrator import transcripts as T
+from context_orchestrator.db import Database
+from context_orchestrator.search import VectorSearch
+
+
+@pytest.fixture
+def db(tmp_path):
+    return Database(db_path=tmp_path / "context.db")
+
+
+@pytest.fixture
+def vs():
+    return VectorSearch(chroma_path=Path(tempfile.mkdtemp()))
+
+
+VTT = """WEBVTT
+
+00:00:05.000 --> 00:00:09.000
+<v Jane Doe>We doubled revenue after moving to annual pricing.
+
+00:01:10.500 --> 00:01:12.000
+<v Host>How long did that take?
+"""
+
+
+def test_add_text_stores_and_dedupes(db):
+    mid, created = T.add_text(db, "[14:00:01] Host: welcome to the show everyone",
+                              title="Podcast with Jane", started_at="2026-09-28T14:00")
+    assert created and mid == "2026-09-28-1400-podcast-with-jane"
+    assert db.get_transcript(mid)["source"] == ""
+    again, created2 = T.add_text(db, "[14:00:01] Host: welcome to the show everyone", title="other")
+    assert again == mid and not created2
+
+
+def test_same_title_same_minute_gets_a_new_id(db):
+    a, _ = T.add_text(db, "first episode text here", title="ep", started_at="2026-09-28T14:00")
+    b, _ = T.add_text(db, "second episode text here", title="ep", started_at="2026-09-28T14:00")
+    assert a != b and b.endswith("-2")
+
+
+def test_captions_become_wall_clock_lines(db):
+    mid, _ = T.add_text(db, VTT, title="Jane", started_at="2026-09-28T14:00:00")
+    body = db.get_transcript(mid)["body"]
+    assert "[14:00:05] Jane Doe: We doubled revenue" in body
+    assert "[14:01:10] Host: How long" in body
+
+
+def test_index_row_gives_timestamped_searchable_chunks(db, vs):
+    mid, _ = T.add_text(db, VTT, title="Jane", started_at="2026-09-28T14:00:00")
+    n = T.index_row(vs, db, db.get_transcript(mid))
+    assert n == 1
+    meta = vs.collection.get(where={"meeting_id": mid}, include=["metadatas"])["metadatas"][0]
+    assert meta["chunk_type"] == "speech" and meta["title"] == "Jane"
+    assert meta["start_ts_iso"].startswith("2026-09-28T14:00:05")
+    assert db.count_transcripts() == (1, 0)
+
+
+def test_failed_embedding_keeps_text_and_old_chunks(db, vs, monkeypatch):
+    mid, _ = T.add_text(db, "[14:00:01] Host: version one of the notes on pricing", started_at="2026-09-28T14:00")
+    T.index_row(vs, db, db.get_transcript(mid))
+    db.put_transcript(mid, "[14:00:01] Host: version two of the notes on pricing", now=time.time() + 1)
+
+    def boom(**_kw):
+        raise RuntimeError("API key not valid")
+    monkeypatch.setattr(vs.collection, "upsert", boom)
+    assert T.index_pending(vs, db, settle_seconds=0, now=time.time() + 5) == []
+    assert "version two" in db.get_transcript(mid)["body"]
+    assert db.count_transcripts() == (1, 1), "still pending, retried later"
+    docs = vs.collection.get(where={"meeting_id": mid})["documents"]
+    assert docs and "version one" in docs[0], "previous index entries stay searchable"
+
+
+def test_import_zip_reads_members_in_memory(db, tmp_path):
+    z = tmp_path / "old.zip"
+    with zipfile.ZipFile(z, "w") as zf:
+        zf.writestr("transcripts/meeting-2026-05-01T10-00-00.md", "# Meeting\n\n[10:00:01] **Me:** hello there team\n")
+        zf.writestr("__MACOSX/._junk.md", "junk")
+        zf.writestr("notes/interview.vtt", VTT)
+        zf.writestr("image.png", b"\x89PNG")
+    stats = T.import_path(db, z)
+    assert stats["stored"] == 2
+    ids = {r["meeting_id"] for r in db.list_transcripts()}
+    assert "meeting-2026-05-01T10-00-00" in ids
+    assert any(i.endswith("-interview") for i in ids)
+    assert T.import_path(db, z)["unchanged"] == 2
+
+
+def test_import_dir_delete_removes_only_stored_settled_files(db, tmp_path):
+    d = tmp_path / "transcripts"
+    d.mkdir()
+    old = d / "meeting-2026-05-01T10-00-00.md"
+    old.write_text("[10:00:01] **Them:** the old meeting text")
+    past = time.time() - 600
+    import os
+    os.utime(old, (past, past))
+    live = d / "meeting-2026-09-28T10-00-00.md"
+    live.write_text("[10:00:01] **Them:** still being written")
+    stats = T.import_path(db, d, delete=True)
+    assert stats == {"stored": 1, "unchanged": 0, "deleted": 1, "skipped_live": 1}
+    assert not old.exists() and live.exists()
+    assert "old meeting text" in db.get_transcript("meeting-2026-05-01T10-00-00")["body"]
+
+
+class _FakeEF:
+    """Deterministic 8-d vectors so a bundle round-trips without any API."""
+    def name(self):
+        return "fake-ef"
+
+    def __call__(self, input):
+        return self.embed_documents(input)
+
+    def embed_documents(self, input):
+        return [[float((hash(t) >> i) & 1) for i in range(8)] for t in input]
+
+    def embed_query(self, input):
+        return self.embed_documents(input if isinstance(input, list) else [input])
+
+
+def test_bundle_round_trip_loads_vectors_without_embedding(db, tmp_path, monkeypatch):
+    src_db = Database(db_path=tmp_path / "other-machine.db")
+    mid, _ = T.add_text(src_db, VTT, title="Jane", started_at="2026-09-28T14:00:00")
+    buf = io.StringIO()
+    assert T.write_bundle([src_db.get_transcript(mid)], buf, _FakeEF()) == 1
+    bundle = tmp_path / "b.jsonl"
+    bundle.write_text(buf.getvalue())
+    assert T.is_bundle(bundle)
+
+    vs = VectorSearch(chroma_path=tmp_path / "chroma")
+    monkeypatch.setattr(T, "_ef_identity", lambda ef: "fake-ef")
+    def no_embedding(*a, **k):
+        raise AssertionError("import must not call the embedding API")
+    monkeypatch.setattr(vs.collection, "_embedding_function", no_embedding, raising=False)
+
+    stats = T.import_bundle(vs, db, bundle)
+    assert stats["vectors_loaded"] == 1 and stats["compatible"]
+    got = vs.collection.get(where={"meeting_id": mid}, include=["embeddings"])
+    assert len(got["embeddings"][0]) == 8
+    assert db.count_transcripts() == (1, 0)
+    # Same bundle again: nothing to do.
+    assert T.import_bundle(vs, db, bundle)["unchanged"] == 1
+
+
+def test_bundle_from_another_model_stores_text_only(db, tmp_path):
+    src_db = Database(db_path=tmp_path / "other.db")
+    mid, _ = T.add_text(src_db, VTT, title="Jane", started_at="2026-09-28T14:00:00")
+    buf = io.StringIO()
+    T.write_bundle([src_db.get_transcript(mid)], buf, _FakeEF())
+    bundle = tmp_path / "b.jsonl"
+    bundle.write_text(buf.getvalue())
+    vs = VectorSearch(chroma_path=tmp_path / "chroma")   # local default EF, not fake-ef
+    stats = T.import_bundle(vs, db, bundle)
+    assert not stats["compatible"] and stats["pending"] == 1
+    assert db.get_transcript(mid) is not None
+    assert vs.collection.count() == 0
+
+
+def test_search_falls_back_to_keywords_when_the_query_cannot_be_embedded(db, vs, monkeypatch):
+    mid, _ = T.add_text(db, VTT, title="Jane", started_at="2026-09-28T14:00:00")
+    T.index_row(vs, db, db.get_transcript(mid))
+
+    def no_key(**_kw):
+        raise RuntimeError("needs a Gemini API key")
+    monkeypatch.setattr(vs.collection, "query", no_key)
+    hits = vs.search("annual pricing revenue", hybrid=True, mmr=True)
+    assert hits and hits[0]["metadata"]["meeting_id"] == mid
+    assert vs.search("annual pricing", where={"meeting_id": "someone-else"}) == []
+    assert vs.search("annual pricing", where={"$and": [{"meeting_id": mid},
+                                                       {"start_ts_unix": {"$gte": 0}}]})
+
+
+def test_gemini_ef_without_a_key_constructs_and_fails_only_when_used(monkeypatch):
+    pytest.importorskip("google.genai")
+    from context_orchestrator import search
+    ef = search._build_gemini_embedding_function("gemini-embedding-001")
+    with pytest.raises(RuntimeError, match="needs a Gemini API key"):
+        ef(["hello"])
+
+
+def test_cli_add_and_show_round_trip(tmp_path, monkeypatch, capsys):
+    monkeypatch.setenv("CO_DB_PATH", str(tmp_path / "c.db"))
+    monkeypatch.setenv("CO_CHROMA_PATH", str(tmp_path / "chroma"))
+    f = tmp_path / "ep.vtt"
+    f.write_text(VTT)
+    assert T.main(["add", str(f), "--title", "Ep 12 Jane", "--started-at", "2026-09-28T14:00",
+                   "--source", "https://example.com/ep12.vtt"]) == 0
+    out = capsys.readouterr().out
+    assert "stored 2026-09-28-1400-ep-12-jane" in out and "indexed" in out
+    assert T.main(["show", "2026-09-28-1400-ep-12-jane"]) == 0
+    assert "[14:00:05] Jane Doe:" in capsys.readouterr().out
+    assert T.main(["add", str(f)]) == 0
+    assert "already stored" in capsys.readouterr().out
+
+
+def test_keyless_round_trip_export_embed_elsewhere_import(tmp_path, monkeypatch):
+    """Work machine (no key) → export pending → other machine embeds → import."""
+    work = Database(db_path=tmp_path / "work.db")
+    mid, _ = T.add_text(work, VTT, title="Ep 12 Jane", started_at="2026-09-28T14:00:00")
+    pending = tmp_path / "pending.jsonl"
+    with pending.open("w") as out:
+        assert T.write_text_bundle(work.transcripts_to_index(time.time()), out) == 1
+    assert T.is_bundle(pending)
+
+    # Other machine: embed straight from the text-only bundle.
+    bundle = tmp_path / "bundle.jsonl"
+    with bundle.open("w") as out:
+        T.write_bundle(T.read_bundle_rows(pending), out, _FakeEF())
+
+    vs = VectorSearch(chroma_path=tmp_path / "chroma")
+    monkeypatch.setattr(T, "_ef_identity", lambda ef: "fake-ef")
+    stats = T.import_bundle(vs, work, bundle)
+    assert stats["vectors_loaded"] == 1
+    assert work.get_transcript(mid)["title"] == "Ep 12 Jane"
+    assert work.count_transcripts() == (1, 0)
+
+
+def test_text_only_bundle_import_just_stores(db, tmp_path):
+    src = Database(db_path=tmp_path / "src.db")
+    T.add_text(src, "[10:00:01] Host: some words about the roadmap", started_at="2026-09-28T10:00")
+    f = tmp_path / "t.jsonl"
+    with f.open("w") as out:
+        T.write_text_bundle([src.get_transcript(r["meeting_id"]) for r in src.list_transcripts()], out)
+    vs = VectorSearch(chroma_path=tmp_path / "chroma")
+    stats = T.import_bundle(vs, db, f)
+    assert stats["text_only"] and stats["stored"] == 1 and stats["pending"] == 1
