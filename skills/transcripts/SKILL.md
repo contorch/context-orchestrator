@@ -1,0 +1,75 @@
+---
+name: transcripts
+description: Add, find and read meeting / podcast / interview transcripts in the contorch memory (SQLite + ChromaDB, no transcript files). Use when the user gives a transcript to store — a URL (Google Doc, .vtt/.srt/.txt link, web page), pasted text, a local file, a zip of old transcripts, or an embedding bundle (.jsonl) made on another machine — or asks what was said in a meeting/podcast, or to list/show/delete stored transcripts.
+---
+
+# Transcripts in the contorch database
+
+Transcripts are rows in `~/.context-orchestrator/context.db` (table `transcripts`). ChromaDB holds the
+search index built from them. **Never write a transcript to a file to "save" it** — store it with the
+tools below, and delete any temporary download afterwards.
+
+Two ways in, same result:
+
+- **MCP tools** (context-orchestrator server): `add_transcript`, `get_transcript`, `list_transcripts`, `search`.
+- **CLI** `contorch-transcripts` — for anything long or bulky (big transcripts, zips, bundles), so the
+  text goes file → database without passing through the conversation.
+
+Find the CLI once per session:
+
+```bash
+CT=$(command -v contorch-transcripts || ls ~/.context-orchestrator/venv/bin/contorch-transcripts ~/.contorch-lite/bin/contorch-transcripts 2>/dev/null | head -1); echo "$CT"
+```
+
+## Adding a transcript
+
+The text must go in **verbatim** — never summarise, clean up, translate, or drop speaker labels or
+timestamps. A transcript that was summarised on the way in is worse than none.
+
+1. **Get the raw text.**
+   - Direct file URL (`.vtt`, `.srt`, `.txt`, `.md`, `.zip`, `.jsonl`, a "download"/"raw" link):
+     `curl -fsSL "<url>" -o "$SCRATCH/<name>"` into the scratchpad directory.
+   - Google Doc / Drive file: read it with the Google Drive tools (full content, not a summary), then
+     write that text to `$SCRATCH/<name>.txt`.
+   - Other web page: WebFetch paraphrases, so do not use it for the transcript body. Use
+     `curl -fsSL` and strip HTML (`python3 -c "import html,re,sys; t=sys.stdin.read(); print(html.unescape(re.sub(r'<[^>]+>','\n',t)))"`),
+     or ask the user for the raw/download link.
+   - Pasted in chat and short (under ~20k characters): call `add_transcript` directly with the text.
+   - A path the user gives: use it as is.
+2. **Work out metadata** — ask only if it's not obvious from the source:
+   - `title`: e.g. "Podcast — Jane Doe on pricing".
+   - `started_at`: when the recording started, local time ISO (`2026-09-28T14:00`). Caption timestamps
+     (`00:12:04`) are offsets from this; it puts them on the real clock. Unknown → leave empty (now).
+   - `source`: the URL, or "pasted".
+3. **Store it.**
+   - One transcript: `"$CT" add "$SCRATCH/<name>" --title "<title>" --started-at "<iso>" --source "<url>"`
+   - A zip / folder of old transcripts: `"$CT" import <path.zip>` (members are read in memory; `.md`,
+     `.txt`, `.vtt`, `.srt` are taken, everything else ignored; re-running is safe — identical text is skipped).
+   - An embedding bundle from another machine (`.jsonl` starting with `"format": "contorch-transcript-bundle"`):
+     `"$CT" import bundle.jsonl` — loads the vectors without calling the embedding API. If it reports
+     "vectors skipped", the bundle was made with a different model; the text is stored and gets embedded here.
+4. **Clean up**: `rm` every file you downloaded or wrote under the scratchpad. Never delete a file the
+   user pointed you at unless they ask (`import <dir> --delete` exists for that).
+5. **Confirm**: report the meeting id(s), word count, and whether it was indexed. "indexing pending" means
+   the text is stored but the embedding call failed (bad/missing Gemini key); it is retried on the next
+   search, or run `"$CT" reindex`. Keyword search already finds it meanwhile.
+
+## Finding and reading
+
+- Question about content → `search(query)`; add `meeting_id=` to stay inside one transcript and
+  `after_date`/`before_date` for time windows.
+- Need the whole conversation around a hit → `get_transcript(meeting_id)` (or `"$CT" show <id>`).
+- What's stored → `list_transcripts()` (or `"$CT" list`).
+- Delete → only on explicit request: `"$CT" rm <id>` (removes the row and its index entries).
+
+## Embedding on another machine
+
+On a machine with a Gemini key and context-orchestrator installed:
+
+```bash
+contorch-transcripts embed old-transcripts.zip -o bundle.jsonl     # or a folder / single file
+```
+
+Then bring `bundle.jsonl` here and `import` it as above. It must be made with the same embedding
+model this machine uses (`CO_EMBEDDING_MODEL`, default `gemini-embedding-001`); the import checks the
+model name and vector size and refuses mismatched vectors.

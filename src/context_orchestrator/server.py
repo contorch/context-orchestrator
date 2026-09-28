@@ -12,26 +12,18 @@ from context_orchestrator.db import Database
 from context_orchestrator.search import VectorSearch
 from context_orchestrator.ingest import index_file_content
 from context_orchestrator.watcher import catch_up as _catch_up_transcripts
+from context_orchestrator import transcripts as _transcripts
 
 # How long after a meeting transcript was last touched do we still auto-link new sources to it?
 RECENT_MEETING_WINDOW_SECONDS = 10 * 60
-TRANSCRIPTS_DIR = Path.home() / "transcripts"
 
 
 def _resolve_default_task_name(project: str = "") -> str:
-    """If a meeting transcript was modified in the last RECENT_MEETING_WINDOW_SECONDS,
-    use its name (sans .md). Otherwise fall back to inbox-YYYY-MM-DD."""
-    if TRANSCRIPTS_DIR.exists():
-        candidates = sorted(
-            TRANSCRIPTS_DIR.glob("meeting-*.md"),
-            key=lambda p: p.stat().st_mtime,
-            reverse=True,
-        )
-        if candidates:
-            most_recent = candidates[0]
-            age = time.time() - most_recent.stat().st_mtime
-            if age <= RECENT_MEETING_WINDOW_SECONDS:
-                return most_recent.stem  # e.g. "meeting-2026-04-26T18-43-05"
+    """If a meeting transcript was appended to in the last RECENT_MEETING_WINDOW_SECONDS,
+    use its meeting id. Otherwise fall back to inbox-YYYY-MM-DD."""
+    latest = db.latest_transcript()
+    if latest and time.time() - latest["updated_at"] <= RECENT_MEETING_WINDOW_SECONDS:
+        return latest["meeting_id"]  # e.g. "meeting-2026-04-26T18-43-05"
     return f"inbox-{date.today().isoformat()}"
 
 
@@ -144,10 +136,10 @@ def _index_new_transcripts(force: bool = False) -> None:
         return
     _last_catch_up = now
     try:
-        indexed = _catch_up_transcripts(vs)
+        indexed = _catch_up_transcripts(vs, db=db)
         if indexed:
             logger.info("indexed %d new/changed transcript(s): %s",
-                        len(indexed), ", ".join(p.name for p in indexed))
+                        len(indexed), ", ".join(indexed))
     except Exception:
         logger.exception("transcript catch-up failed")
 
@@ -191,7 +183,11 @@ IMPORTANT BEHAVIORS:
    - "url" for other URLs (Slack, Confluence, etc.)
    - "text" for inline text pasted in conversation
 
-5. AUTO-SEARCH: When you're unsure about something or need context you don't have, call search()
+5. TRANSCRIPTS: Meeting and podcast transcripts are stored in the database, not in files.
+   To store one the user gives you (pasted, a URL you fetched, a file), call add_transcript().
+   To read a whole meeting after search() finds a chunk of it, call get_transcript(meeting_id).
+
+6. AUTO-SEARCH: When you're unsure about something or need context you don't have, call search()
    BEFORE saying you don't know. search() finds relevant information across ALL tasks and repos
    using semantic search. You don't need to know which task or repo — just describe what you need.
 """,
@@ -451,6 +447,83 @@ def get_repo_knowledge(repo_url: str) -> str:
     return "\n".join(lines)
 
 
+@mcp.tool()
+def add_transcript(text: str, title: str = "", started_at: str = "", source: str = "",
+                   meeting_id: str = "") -> str:
+    """Store a meeting / podcast / interview transcript and index it for search().
+
+    The full text goes into the database (there are no transcript files); the
+    search index is built from it. WebVTT and SRT captions are converted to
+    `[HH:MM:SS] Speaker: text` lines automatically. Storing the same text
+    twice is a no-op.
+
+    Args:
+        text: The complete transcript. Keep speaker labels and timestamps if present.
+            Plain `[HH:MM:SS] Speaker: text` lines give the best time-window search.
+        title: Short human title, e.g. "Podcast with Jane Doe — pricing".
+        started_at: ISO date/time the recording started, local time, e.g.
+            "2026-09-28T14:00". Used for the id and to put caption offsets on
+            the wall clock. Defaults to now.
+        source: Where it came from — the URL, or "pasted".
+        meeting_id: Only to replace an existing transcript's text. Leave empty
+            for new transcripts; an id like 2026-09-28-1400-<title-slug> is made.
+    """
+    try:
+        mid, created = _transcripts.add_text(db, text, title=title, started_at=started_at,
+                                             source=source, meeting_id=meeting_id)
+    except ValueError as e:
+        return f"Error: {e}"
+    if not created:
+        return f"Already stored as {mid} (identical text) — nothing added."
+    row = db.get_transcript(mid)
+    try:
+        n = _transcripts.index_row(vs, db, row)
+        status = f"indexed as {n} chunk(s)"
+    except Exception as e:
+        status = f"stored, but indexing failed and will be retried on the next search: {str(e)[:160]}"
+    words = len(row["body"].split())
+    return f"Stored transcript {mid} ({words} words) — {status}."
+
+
+@mcp.tool()
+def get_transcript(meeting_id: str, max_chars: int = 200000) -> str:
+    """Return a stored transcript's full text. Use after search() shows a
+    `[transcript: <meeting_id>]` hit and you need the surrounding conversation.
+
+    Args:
+        meeting_id: The id shown in search results or list_transcripts().
+        max_chars: Truncate very long transcripts to this many characters.
+    """
+    row = db.get_transcript(meeting_id)
+    if not row:
+        return f"Error: No transcript '{meeting_id}'. Use list_transcripts() to see ids."
+    body = row["body"]
+    head = f"Transcript {meeting_id}" + (f" — {row['title']}" if row["title"] and row["title"] != meeting_id else "")
+    if row["source"]:
+        head += f" (source: {row['source']})"
+    if len(body) > max_chars:
+        body = body[:max_chars] + f"\n… [truncated; {len(row['body'])} chars total]"
+    return f"{head}\n\n{body}"
+
+
+@mcp.tool()
+def list_transcripts(limit: int = 20) -> str:
+    """List the most recently updated transcripts (id, size, title).
+
+    Args:
+        limit: How many to list.
+    """
+    rows = db.list_transcripts(limit)
+    if not rows:
+        return "No transcripts stored yet."
+    total, pending = db.count_transcripts()
+    lines = [f"{total} transcript(s), {pending} waiting to be indexed. Most recent:"]
+    for r in rows:
+        title = f" — {r['title']}" if r["title"] and r["title"] != r["meeting_id"] else ""
+        lines.append(f"  {r['meeting_id']} ({r['chars']} chars){title}")
+    return "\n".join(lines)
+
+
 def _parse_iso_date(s: str):
     """Parse a date or datetime string to a unix timestamp. Accepts:
         - "2026-04-30"           (date only — interpreted as 00:00 UTC)
@@ -496,9 +569,10 @@ def search(
             Useful for "what happened in the last meeting" / "this week" queries.
         before_date: Optional ISO date/datetime — only return chunks captured at
             or before this point. Pair with `after_date` for time-window queries.
-        meeting_id: Optional exact match on a transcript filename stem (without
-            .md). Use when you know which meeting holds the answer and want
-            chunks scoped to it. Example: "meeting-2026-04-30T13-40-35".
+        meeting_id: Optional exact match on a transcript id. Use when you know
+            which meeting holds the answer and want chunks scoped to it.
+            Example: "meeting-2026-04-30T13-40-35". get_transcript(meeting_id)
+            returns the whole text.
         rerank: When True, send the top candidates through an LLM (configured
             via the CO_RERANK_MODEL env var, e.g. "gemini-flash-latest") for
             relevance scoring and re-rank by score. Adds 1-3s latency and a
@@ -592,8 +666,10 @@ def search(
         elif doc_type == "transcript":
             ts = meta.get("start_ts_iso", "")
             ts_prefix = f"{ts} " if ts else ""
+            title = meta.get("title", "")
+            title = f" ({title})" if title and title != meta.get("meeting_id") else ""
             lines.append(
-                f"  [transcript: {meta.get('meeting_id', meta.get('filename', '?'))}] "
+                f"  [transcript: {meta.get('meeting_id', meta.get('filename', '?'))}{title}] "
                 f"{ts_prefix}{h['text'][:200]}"
             )
         else:

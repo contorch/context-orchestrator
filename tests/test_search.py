@@ -212,24 +212,18 @@ class TestEmbeddingModelOverride:
             msg = str(e).lower()
             assert "embeddings-gemini" in msg or "google-genai" in msg
 
-    def test_gemini_without_key_raises_clear_error(self, monkeypatch, tmp_path):
+    def test_gemini_without_key_starts_and_fails_only_when_embedding(self, monkeypatch, tmp_path):
+        """No key is a supported setup (vectors imported from bundles made on
+        another machine): building the EF must succeed; embedding reports it."""
+        pytest.importorskip("google.genai")
         from context_orchestrator import search as s
         monkeypatch.setenv(s.EMBEDDING_MODEL_ENV, "gemini-embedding-001")
-        # Point the key file at a non-existent path AND clear env vars
         monkeypatch.setattr(s, "GEMINI_KEY_FILE", tmp_path / "nope")
         monkeypatch.delenv("GOOGLE_API_KEY", raising=False)
         monkeypatch.delenv("GEMINI_API_KEY", raising=False)
-        try:
-            s._build_embedding_function()
-        except RuntimeError as e:
-            msg = str(e)
-            # Either "needs a Gemini API key" (extra installed, key missing)
-            # OR "embeddings-gemini" (extra missing, error happens earlier).
-            assert ("API key" in msg) or ("embeddings-gemini" in msg)
-        else:
-            # Should not succeed without a key — but if google-genai isn't
-            # installed and we somehow reach here, fail loudly.
-            assert False, "expected RuntimeError without API key"
+        ef = s._build_embedding_function()
+        with pytest.raises(RuntimeError, match="API key"):
+            ef(["hello"])
 
     def test_resolve_key_prefers_env(self, monkeypatch, tmp_path):
         from context_orchestrator import search as s
@@ -289,3 +283,38 @@ class TestLLMRerank:
     def test_rerank_helper_handles_empty_candidates(self):
         from context_orchestrator.search import _llm_rerank
         assert _llm_rerank("query", [], 5, "gemini-flash-latest") == []
+
+
+class TestChromaModeSelection:
+    def test_env_path_wins(self, monkeypatch, tmp_path):
+        from context_orchestrator import search as s
+        monkeypatch.setenv("CO_CHROMA_PATH", str(tmp_path / "c"))
+        assert s._embedded_path_if_no_server() == tmp_path / "c"
+
+    def test_installed_server_is_used(self, monkeypatch, tmp_path):
+        from context_orchestrator import search as s, chroma_daemon
+        monkeypatch.delenv("CO_CHROMA_PATH", raising=False)
+        plist = tmp_path / "chroma.plist"
+        plist.write_text("x")
+        monkeypatch.setattr(chroma_daemon, "LAUNCHD_PLIST", plist)
+        assert s._embedded_path_if_no_server() is None
+
+    def test_no_server_means_embedded_default_folder(self, monkeypatch, tmp_path):
+        from context_orchestrator import search as s, chroma_daemon
+        monkeypatch.delenv("CO_CHROMA_PATH", raising=False)
+        monkeypatch.delenv("CO_CHROMA_HOST", raising=False)
+        monkeypatch.delenv("CO_CHROMA_PORT", raising=False)
+        monkeypatch.setattr(chroma_daemon, "LAUNCHD_PLIST", tmp_path / "none.plist")
+        assert s._embedded_path_if_no_server() == s.DEFAULT_CHROMA_PATH
+
+
+def test_env_file_fills_only_unset_vars(tmp_path, monkeypatch):
+    import os
+    import context_orchestrator as co
+    fake_env = {"CO_Y_TEST": "from-env"}
+    monkeypatch.setattr(os, "environ", fake_env)   # nothing leaks into later tests
+    f = tmp_path / "env"
+    f.write_text("# comment\nCO_EMBEDDING_MODEL=gemini-embedding-001\nexport CO_X_TEST='a b'\nCO_Y_TEST=from-file\n")
+    got = co.load_env_file(f)
+    assert got == {"CO_EMBEDDING_MODEL": "gemini-embedding-001", "CO_X_TEST": "a b"}
+    assert fake_env["CO_Y_TEST"] == "from-env"

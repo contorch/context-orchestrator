@@ -8,7 +8,7 @@
 
 MCP server that gives Claude persistent memory of your tasks, sources, and repo knowledge across sessions, with a vector index over everything you've captured.
 
-Pairs with [meeting-capture](https://github.com/contorch/meeting-capture) — that daemon writes meeting transcripts to `~/transcripts/`, and this project's `transcript-watcher` indexes them automatically. Either project runs without the other.
+Pairs with [meeting-capture](https://github.com/contorch/meeting-capture) — that daemon writes meeting transcripts straight into this project's database (`~/.context-orchestrator/context.db`, table `transcripts`), and the MCP server indexes each meeting once it ends. There are no transcript files. Either project runs without the other.
 
 ## Requirements
 
@@ -38,7 +38,24 @@ cd context-orchestrator
 
 `setup.sh` checks prerequisites, creates a Python venv, registers the MCP server with Claude Code (via `claude mcp add`), appends standard usage instructions to `~/.claude/CLAUDE.md`, installs the chroma HTTP server launchd agent (with a one-time backup of any existing chroma data), and installs the `transcript-watcher` launchd auto-start agent.
 
-After either install path, restart Claude Code so the new MCP server is loaded.
+### Lightweight — database + index only, no daemons
+
+For a machine that only needs the memory (e.g. a work laptop): SQLite for the transcripts and tasks, ChromaDB opened in-process from a folder, the MCP server Claude Code starts per session, and nothing running in the background — no chroma server, no watcher, no meeting-capture.
+
+```bash
+python3 -m venv ~/.contorch-lite                     # Python 3.10+
+~/.contorch-lite/bin/pip install "context-orchestrator[embeddings-gemini] @ git+https://github.com/contorch/context-orchestrator"
+mkdir -p ~/.context-orchestrator
+echo "CO_EMBEDDING_MODEL=gemini-embedding-001" >> ~/.context-orchestrator/env   # must match the machine that embeds
+claude mcp add -s user context-orchestrator -- ~/.contorch-lite/bin/contorch-mcp
+mkdir -p ~/.claude/skills/transcripts && curl -fsSL \
+  https://raw.githubusercontent.com/contorch/context-orchestrator/main/skills/transcripts/SKILL.md \
+  -o ~/.claude/skills/transcripts/SKILL.md
+```
+
+With no chroma launchd agent installed, the index is opened from `~/.context-orchestrator/chroma/` directly (several Claude Code sessions can share it). A Gemini key is optional here: without one, vectors come from embedding bundles made on another machine (`contorch-transcripts embed … -o bundle.jsonl` there, `contorch-transcripts import bundle.jsonl` here) and `search` falls back to keyword matching for the query. With a key (`~/.config/google/key`), transcripts are embedded locally and search is semantic.
+
+After any install path, restart Claude Code so the new MCP server is loaded.
 
 To verify:
 
@@ -58,13 +75,16 @@ To verify:
 | `remove_source` | Remove a source from a task |
 | `update_repo_knowledge` | Save a learning about a repo (setup, testing, conventions, gotchas) |
 | `get_repo_knowledge` | Get all stored knowledge for a repo |
-| `search` | Semantic search across all tasks, sources, transcripts, and repo knowledge |
+| `search` | Semantic search across all tasks, sources, transcripts, and repo knowledge (keyword fallback when the query can't be embedded) |
+| `add_transcript` | Store a transcript (text, WebVTT or SRT) in the database and index it |
+| `get_transcript` | Full text of a stored transcript |
+| `list_transcripts` | Most recent transcripts |
 
 ## Components
 
 ### MCP server
 
-Long-lived process spawned by Claude Code on session start. Exposes the tools above. Connects to the chroma HTTP server for the vector index and to a local SQLite database at `~/.context-orchestrator/context.db` for task and source metadata.
+Long-lived process spawned by Claude Code on session start. Exposes the tools above. Uses a local SQLite database at `~/.context-orchestrator/context.db` for tasks, sources and transcripts, and ChromaDB for the vector index — via the chroma HTTP server when its launchd agent is installed, otherwise in-process from `~/.context-orchestrator/chroma/` (`CO_CHROMA_PATH` overrides).
 
 ### chroma server
 
@@ -76,9 +96,27 @@ The vector index is served by a `chroma run` HTTP daemon (launchd-managed) liste
 | `context-orchestrator-chroma install` | Install and start the launchd agent |
 | `context-orchestrator-chroma uninstall` | Stop and remove the launchd agent |
 
+### Transcripts
+
+Every transcript is a row in the `transcripts` table (full text in `body`); Chroma holds only the index built from it. The text is stored before anything is embedded, so a failing embedding call (bad key, quota, offline) loses nothing — the row stays pending and is indexed on a later `search`. A meeting still being appended to by meeting-capture is indexed once it has been quiet for 60 s.
+
+| Command | Purpose |
+|---|---|
+| `contorch-transcripts add FILE\|- --title T --started-at ISO --source URL` | Add one transcript (.txt/.md/.vtt/.srt; captions are put on the wall clock) |
+| `contorch-transcripts import PATH [--delete]` | Import a file, folder or zip (read in memory), or an embedding bundle; `--delete` removes each source file once stored |
+| `contorch-transcripts embed PATH -o bundle.jsonl` | On a machine with a Gemini key: chunk + embed into a bundle to import elsewhere without API calls |
+| `contorch-transcripts export OUT.jsonl --pending` | Text of not-yet-embedded transcripts, to `embed` on another machine |
+| `contorch-transcripts list \| show ID \| rm ID \| reindex [ID]` | Inspect, delete, re-embed |
+
+A bundle records the embedding function and vector size; `import` loads the vectors only when they match this index, otherwise it stores the text and embeds it locally.
+
+The `skills/transcripts` Claude Code skill wraps all of this: give Claude a URL, a pasted transcript, a zip or a bundle and it stores it verbatim.
+
+Moving from the old `~/transcripts/*.md` files: `contorch-transcripts import ~/transcripts --delete`.
+
 ### transcript-watcher
 
-Standalone daemon (launchd-managed) that polls `~/transcripts/` every 5 seconds and indexes new or modified Markdown files into the chroma server, into the same collection used by the MCP `search` tool. CLI:
+Optional. Transcripts are indexed on demand by the MCP server; the watcher (and the MCP server's catch-up) also imports any `.md` still dropped into `~/transcripts/` by an older meeting-capture into the database. CLI:
 
 | Command | Purpose |
 |---|---|
@@ -91,11 +129,12 @@ Standalone daemon (launchd-managed) that polls `~/transcripts/` every 5 seconds 
 
 ### save-transcript
 
-Manual transcript capture utility. Saves the current clipboard to `~/transcripts/{date}-{name}.md` and indexes it. Useful when you don't have meeting-capture installed but want to drop a transcript into the index.
+Manual transcript capture utility. Stores the current clipboard as a transcript in the database and indexes it (`--file PATH` stores a file instead).
 
 ## Storage
 
-- `~/.context-orchestrator/context.db` — SQLite (tasks, sources, repo knowledge metadata)
+- `~/.context-orchestrator/context.db` — SQLite (tasks, sources, repo knowledge, transcripts)
+- `~/.context-orchestrator/env` — optional `KEY=VALUE` settings read by every entry point (environment wins)
 - `~/.context-orchestrator/chroma/` — ChromaDB vector index, served by the chroma daemon (uses the default `all-MiniLM-L6-v2` embeddings; no API key required)
 - `~/.context-orchestrator/chroma-daemon.log` — chroma server stdout / stderr
 - `~/.context-orchestrator/watcher_state.json` — transcript-watcher mtime cache

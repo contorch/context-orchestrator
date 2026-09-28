@@ -18,7 +18,6 @@ def _isolated_state(monkeypatch, tmp_path):
 
     monkeypatch.setattr(server, "db", Database(db_path=tmp_path / "ctx.db"))
     monkeypatch.setattr(server, "vs", VectorSearch(chroma_path=tmp_path / "chroma"))
-    monkeypatch.setattr(server, "TRANSCRIPTS_DIR", tmp_path / "transcripts")
 
 
 def test_detect_source_type_url():
@@ -42,30 +41,18 @@ def test_resolve_default_task_falls_back_to_inbox(tmp_path):
     assert server._resolve_default_task_name() == f"inbox-{date.today().isoformat()}"
 
 
-def test_resolve_default_task_uses_recent_meeting(tmp_path, monkeypatch):
-    transcripts = tmp_path / "transcripts"
-    transcripts.mkdir()
-    recent = transcripts / "meeting-2026-04-26T18-43-05.md"
-    recent.write_text("# Meeting transcript\n[18:43:05] hello\n")
-    # mtime is "now" by default — within the 10-min window
-    monkeypatch.setattr(server, "TRANSCRIPTS_DIR", transcripts)
+def test_resolve_default_task_uses_recent_meeting():
+    # Appended just now (meeting-capture writes straight to the table).
+    server.db.put_transcript("meeting-2026-04-26T18-43-05", "# Meeting transcript\n[18:43:05] hello\n")
     assert server._resolve_default_task_name() == "meeting-2026-04-26T18-43-05"
 
 
-def test_resolve_default_task_ignores_old_meeting(tmp_path, monkeypatch):
-    transcripts = tmp_path / "transcripts"
-    transcripts.mkdir()
-    old = transcripts / "meeting-2025-01-01T00-00-00.md"
-    old.write_text("ancient")
-    # set mtime to 2 hours ago — outside the 10-min window
-    long_ago = time.time() - 7200
-    os.utime(old, (long_ago, long_ago))
-    monkeypatch.setattr(server, "TRANSCRIPTS_DIR", transcripts)
+def test_resolve_default_task_ignores_old_meeting():
+    server.db.put_transcript("meeting-2025-01-01T00-00-00", "ancient", now=time.time() - 7200)
     assert server._resolve_default_task_name() == f"inbox-{date.today().isoformat()}"
 
 
-def test_drop_text_no_task(monkeypatch, tmp_path):
-    monkeypatch.setattr(server, "TRANSCRIPTS_DIR", tmp_path / "no-such-dir")
+def test_drop_text_no_task():
     result = server.drop("just some text I want saved")
     assert "auto-task" in result or "created task" in result
     assert f"inbox-{date.today().isoformat()}" in result
@@ -85,12 +72,8 @@ def test_drop_file_auto_detects_type(tmp_path):
     assert str(f) in result
 
 
-def test_drop_attaches_to_recent_meeting(tmp_path, monkeypatch):
-    transcripts = tmp_path / "transcripts"
-    transcripts.mkdir()
-    recent = transcripts / "meeting-2026-04-26T18-43-05.md"
-    recent.write_text("# Meeting transcript\n[18:43:05] hello\n")
-    monkeypatch.setattr(server, "TRANSCRIPTS_DIR", transcripts)
+def test_drop_attaches_to_recent_meeting():
+    server.db.put_transcript("meeting-2026-04-26T18-43-05", "# Meeting transcript\n[18:43:05] hello\n")
 
     result = server.drop("https://example.com/q3-design", notes="presenter Sarah")
     assert "meeting-2026-04-26T18-43-05" in result

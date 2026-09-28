@@ -164,17 +164,21 @@ def _build_gemini_embedding_function(model_name: str):
             "pip install -e '.[embeddings-gemini]'"
         ) from e
     api_key = _resolve_gemini_api_key()
-    if not api_key:
-        raise RuntimeError(
-            f"{EMBEDDING_MODEL_ENV}={model_name} needs a Gemini API key. "
-            "Set GOOGLE_API_KEY or GEMINI_API_KEY, or write the key to "
-            f"{GEMINI_KEY_FILE} (mode 600)."
-        )
-    client = genai.Client(api_key=api_key)
+    # No key is a supported setup (a machine that only imports embedding
+    # bundles made elsewhere): the server still starts, vectors come from the
+    # bundles, and search falls back to keyword matching. Only an actual
+    # embedding call reports the missing key.
+    client = genai.Client(api_key=api_key) if api_key else None
 
     import numpy as np
 
     def _embed(texts, task_type: str):
+        if client is None:
+            raise RuntimeError(
+                f"{EMBEDDING_MODEL_ENV}={model_name} needs a Gemini API key to embed. "
+                "Set GOOGLE_API_KEY or GEMINI_API_KEY, or write the key to "
+                f"{GEMINI_KEY_FILE} (mode 600)."
+            )
         result = client.models.embed_content(
             model=model_name,
             contents=texts,
@@ -326,6 +330,47 @@ def _mmr_select(candidates: list[dict], k: int, lam: float) -> list[dict]:
     return [candidates[i] for i in selected]
 
 
+def _embedded_path_if_no_server() -> Optional[Path]:
+    """Which Chroma to use when the caller didn't say.
+
+    CO_CHROMA_PATH → that folder, in-process. CO_CHROMA_HOST/PORT set, or the
+    chroma launchd server installed → the server (HTTP). Otherwise — a
+    lightweight install with no server — the default folder, in-process.
+    Several processes (one MCP server per Claude Code session, the CLI) can
+    open the same folder at once.
+    """
+    env_path = os.environ.get("CO_CHROMA_PATH")
+    if env_path:
+        return Path(env_path).expanduser()
+    if os.environ.get("CO_CHROMA_HOST") or os.environ.get("CO_CHROMA_PORT"):
+        return None
+    from .chroma_daemon import LAUNCHD_PLIST
+    return None if LAUNCHD_PLIST.exists() else DEFAULT_CHROMA_PATH
+
+
+def _matches_where(meta: dict, where: dict) -> bool:
+    """Evaluate the subset of Chroma `where` syntax that search() produces."""
+    if "$and" in where:
+        return all(_matches_where(meta, w) for w in where["$and"])
+    if "$or" in where:
+        return any(_matches_where(meta, w) for w in where["$or"])
+    for key, cond in where.items():
+        val = meta.get(key)
+        if isinstance(cond, dict):
+            for op, ref in cond.items():
+                if val is None:
+                    return False
+                if op == "$gte" and not val >= ref: return False
+                if op == "$lte" and not val <= ref: return False
+                if op == "$gt" and not val > ref: return False
+                if op == "$lt" and not val < ref: return False
+                if op == "$eq" and val != ref: return False
+                if op == "$ne" and val == ref: return False
+        elif val != cond:
+            return False
+    return True
+
+
 class VectorSearch:
     """Connects to Chroma. Two modes:
 
@@ -343,6 +388,8 @@ class VectorSearch:
         host: Optional[str] = None,
         port: Optional[int] = None,
     ):
+        if chroma_path is None and host is None and port is None:
+            chroma_path = _embedded_path_if_no_server()
         self.chroma_path = chroma_path
         if chroma_path is not None:
             self.host = None
@@ -478,6 +525,7 @@ class VectorSearch:
         tokenized = [_bm25_tokenize(d) for d in docs]
         self._bm25 = BM25Okapi(tokenized)
         self._bm25_ids = ids
+        self._bm25_tokens = [set(t) for t in tokenized]
 
     def add(self, doc_id: str, text: str, metadata: dict) -> None:
         """Add or update a document in the vector index."""
@@ -531,6 +579,47 @@ class VectorSearch:
                 env var, e.g. "gemini-flash-latest"). Soft-fails to base
                 ranking if the model can't be reached or no key is set.
         """
+        try:
+            return self._search(query, n_results, where, mmr, mmr_lambda, hybrid,
+                                rerank, rerank_model)
+        except Exception as exc:
+            # The query couldn't be embedded (no key, invalid key, quota,
+            # offline). Keyword matching over the same documents still answers
+            # most proper-noun questions, so degrade instead of failing.
+            logger.warning("dense search unavailable (%s) — falling back to keyword search",
+                           str(exc)[:160])
+            return self._keyword_search(query, n_results, where)
+
+    def _keyword_search(self, query: str, n_results: int, where: Optional[dict]) -> list[dict]:
+        """BM25 over every document, filtered by `where` (equality, $gte, $lte,
+        $and — the operators search() builds)."""
+        self._ensure_bm25()
+        if self._bm25 is None:
+            return []
+        terms = _bm25_tokenize(query)
+        scores = self._bm25.get_scores(terms)
+        # Keep only documents containing a query term (BM25 idf goes negative
+        # for terms in most of a small corpus, so the score alone can't say).
+        wanted = set(terms)
+        order = [i for i in sorted(range(len(scores)), key=lambda i: -scores[i])
+                 if wanted & self._bm25_tokens[i]]
+        out: list[dict] = []
+        for start in range(0, len(order), 200):
+            ids = [self._bm25_ids[i] for i in order[start:start + 200]]
+            got = self.collection.get(ids=ids, include=["documents", "metadatas"])
+            by_id = {id_: (got["documents"][k], got["metadatas"][k]) for k, id_ in enumerate(got["ids"])}
+            for id_ in ids:
+                if id_ not in by_id:
+                    continue
+                doc, meta = by_id[id_]
+                if where and not _matches_where(meta or {}, where):
+                    continue
+                out.append({"id": id_, "text": doc, "metadata": meta or {}, "distance": None})
+                if len(out) >= n_results:
+                    return out
+        return out
+
+    def _search(self, query, n_results, where, mmr, mmr_lambda, hybrid, rerank, rerank_model):
         total = self.collection.count() or 1
 
         # Resolve the rerank model up front so misconfig fails loudly only
