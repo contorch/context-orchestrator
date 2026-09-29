@@ -31,6 +31,7 @@ import hashlib
 import io
 import json
 import logging
+import os
 import re
 import sys
 import time
@@ -432,14 +433,68 @@ def _open_vs():
     return VectorSearch(chroma_path=Path(p) if p else None)
 
 
+BACKUP_DIR = Path.home() / ".context-orchestrator" / "backups"
+
+
+class BackupError(RuntimeError):
+    """The backup zip could not be written or didn't verify — nothing deleted."""
+
+
+def backup_files(files: list[Path], root: Path, backup_dir: Optional[Path] = None,
+                 label: str = "transcripts") -> Path:
+    """Zip `files` (paths kept relative to `root`, with modification times),
+    then re-open the archive and compare every member byte-for-byte with the
+    file on disk. Returns the zip path; raises BackupError on any mismatch, so
+    callers delete only after this returns."""
+    backup_dir = backup_dir or BACKUP_DIR
+    backup_dir.mkdir(parents=True, exist_ok=True)
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    dest = backup_dir / f"{label}-{stamp}.zip"
+    n = 2
+    while dest.exists():
+        dest = backup_dir / f"{label}-{stamp}-{n}.zip"
+        n += 1
+    tmp = dest.with_suffix(".zip.partial")
+    names: dict[Path, str] = {}
+    try:
+        with zipfile.ZipFile(tmp, "w", compression=zipfile.ZIP_DEFLATED) as z:
+            for f in files:
+                try:
+                    arc = str(f.relative_to(root)) if root.is_dir() else f.name
+                except ValueError:
+                    arc = f.name
+                if arc in names.values():
+                    arc = f"{len(names)}-{arc}"
+                z.write(f, arc)
+                names[f] = arc
+        with zipfile.ZipFile(tmp) as z:
+            bad = z.testzip()
+            if bad is not None:
+                raise BackupError(f"backup zip is corrupt at {bad}")
+            for f, arc in names.items():
+                if z.read(arc) != f.read_bytes():
+                    raise BackupError(f"backup of {f} does not match the file")
+        tmp.chmod(0o600)   # transcripts are private
+        os.replace(tmp, dest)
+    except BackupError:
+        tmp.unlink(missing_ok=True)
+        raise
+    except OSError as exc:
+        tmp.unlink(missing_ok=True)
+        raise BackupError(f"could not write backup {dest}: {exc}") from exc
+    return dest
+
+
 def import_path(db, path: Path, delete: bool = False,
-                settle_seconds: float = SETTLE_SECONDS) -> dict:
+                settle_seconds: float = SETTLE_SECONDS, backup_dir: Optional[Path] = None) -> dict:
     """Import a file, directory or zip into the database. With delete=True,
-    each on-disk file is removed once its text is verifiably stored; files
-    touched in the last `settle_seconds` (a meeting still being written by an
-    older meeting-capture) are skipped."""
-    stats = {"stored": 0, "unchanged": 0, "deleted": 0, "skipped_live": 0}
+    the files whose text is verifiably stored are first zipped into
+    `backup_dir` (verified byte-for-byte) and only then removed; if the backup
+    fails nothing is deleted. Files touched in the last `settle_seconds` (a
+    meeting still being written by an older meeting-capture) are skipped."""
+    stats = {"stored": 0, "unchanged": 0, "deleted": 0, "skipped_live": 0, "backup": ""}
     now = time.time()
+    to_delete: list[Path] = []
     for name, text, mtime, disk in iter_text_files(path):
         if disk is not None and now - disk.stat().st_mtime < settle_seconds:
             stats["skipped_live"] += 1
@@ -449,8 +504,12 @@ def import_path(db, path: Path, delete: bool = False,
         if delete and disk is not None:
             row = db.get_transcript(mid)
             if row and row["body"].strip():
-                disk.unlink()
-                stats["deleted"] += 1
+                to_delete.append(disk)
+    if to_delete:
+        stats["backup"] = str(backup_files(to_delete, path, backup_dir))
+        for f in to_delete:
+            f.unlink()
+            stats["deleted"] += 1
     return stats
 
 
@@ -467,9 +526,14 @@ def _cmd_import(args) -> int:
         if not stats["compatible"] and not stats["text_only"]:
             print("  vectors skipped: they were made with a different embedding model or size", file=sys.stderr)
         return 0
-    stats = import_path(db, path, delete=args.delete)
+    try:
+        stats = import_path(db, path, delete=args.delete)
+    except BackupError as exc:
+        print(f"nothing deleted: {exc}", file=sys.stderr)
+        return 1
     print(f"{stats['stored']} stored, {stats['unchanged']} already there"
           + (f", {stats['deleted']} file(s) deleted" if args.delete else "")
+          + (f"\nbackup of the deleted files: {stats['backup']}" if stats["backup"] else "")
           + (f", {stats['skipped_live']} skipped (modified in the last minute)" if stats["skipped_live"] else ""))
     if not args.no_index:
         vs = _open_vs()
@@ -568,13 +632,39 @@ def _cmd_show(args) -> int:
     return 0
 
 
+def backup_transcript(row: dict, backup_dir: Optional[Path] = None) -> Path:
+    """Append a transcript's full text (plus its metadata) to
+    backups/deleted-transcripts.zip before it is deleted; verified by reading
+    it back."""
+    backup_dir = backup_dir or BACKUP_DIR
+    backup_dir.mkdir(parents=True, exist_ok=True)
+    dest = backup_dir / "deleted-transcripts.zip"
+    arc = f"{row['meeting_id']}-deleted-{time.strftime('%Y%m%d-%H%M%S')}.md"
+    meta = {k: row.get(k, "") for k in ("meeting_id", "title", "source", "started_at")}
+    data = f"<!-- {json.dumps(meta)} -->\n{row['body']}".encode("utf-8")
+    with zipfile.ZipFile(dest, "a", compression=zipfile.ZIP_DEFLATED) as z:
+        z.writestr(arc, data)
+    with zipfile.ZipFile(dest) as z:
+        if z.read(arc) != data:
+            raise BackupError(f"backup of {row['meeting_id']} did not verify")
+    dest.chmod(0o600)
+    return dest
+
+
 def _cmd_rm(args) -> int:
     db = _open_db()
-    if not db.delete_transcript(args.meeting_id):
+    row = db.get_transcript(args.meeting_id)
+    if not row:
         print(f"no transcript {args.meeting_id}", file=sys.stderr)
         return 1
+    try:
+        dest = backup_transcript(row)
+    except (BackupError, OSError) as exc:
+        print(f"not deleted — backup failed: {exc}", file=sys.stderr)
+        return 1
+    db.delete_transcript(args.meeting_id)
     remove_from_index(_open_vs(), args.meeting_id)
-    print(f"deleted {args.meeting_id}")
+    print(f"deleted {args.meeting_id} (text kept in {dest})")
     return 0
 
 

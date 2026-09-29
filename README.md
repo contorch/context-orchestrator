@@ -115,10 +115,10 @@ Every transcript is a row in the `transcripts` table (full text in `body`); Chro
 | Command | Purpose |
 |---|---|
 | `contorch-transcripts add FILE\|- --title T --started-at ISO --source URL` | Add one transcript (.txt/.md/.vtt/.srt; captions are put on the wall clock) |
-| `contorch-transcripts import PATH [--delete]` | Import a file, folder or zip (read in memory), or an embedding bundle; `--delete` removes each source file once stored |
+| `contorch-transcripts import PATH [--delete]` | Import a file, folder or zip (read in memory), or an embedding bundle; `--delete` first zips the files into `~/.context-orchestrator/backups/transcripts-<time>.zip`, verifies the zip byte-for-byte, then removes them (nothing is deleted if the backup fails) |
 | `contorch-transcripts embed PATH -o bundle.jsonl` | On a machine with a Gemini key: chunk + embed into a bundle to import elsewhere without API calls |
 | `contorch-transcripts export OUT.jsonl --pending` | Text of not-yet-embedded transcripts, to `embed` on another machine |
-| `contorch-transcripts list \| show ID \| rm ID \| reindex [ID]` | Inspect, delete, re-embed |
+| `contorch-transcripts list \| show ID \| rm ID \| reindex [ID]` | Inspect, delete (the text is kept in `backups/deleted-transcripts.zip` first), re-embed |
 
 A bundle records the embedding function and vector size; `import` loads the vectors only when they match this index, otherwise it stores the text and embeds it locally.
 

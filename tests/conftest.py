@@ -31,3 +31,7 @@ def _no_real_gemini_key(monkeypatch, tmp_path):
     # restore the original state afterwards, so it can't leak between tests.
     monkeypatch.setenv("CO_EMBEDDING_MODEL", "")
     monkeypatch.delenv("CO_EMBEDDING_MODEL")
+    # Backups (written before any delete) must never land in the real
+    # ~/.context-orchestrator/backups from a test.
+    from context_orchestrator import transcripts
+    monkeypatch.setattr(transcripts, "BACKUP_DIR", tmp_path / "backups")
