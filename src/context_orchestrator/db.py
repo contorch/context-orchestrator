@@ -1,3 +1,4 @@
+import re
 import sqlite3
 import sys
 import logging
@@ -54,10 +55,74 @@ CREATE TABLE IF NOT EXISTS transcripts (
     content_sha TEXT NOT NULL DEFAULT '',
     created_at REAL NOT NULL,
     updated_at REAL NOT NULL,
-    indexed_at REAL
+    indexed_at REAL,
+    indexed_with TEXT NOT NULL DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS idx_transcripts_updated ON transcripts(updated_at);
 """
+
+# Full-text search (SQLite FTS5) over everything the vector index covers, so
+# search works with no embedding model at all and finds a transcript the
+# moment it is stored. Kept in sync by triggers — including meeting-capture's
+# line-by-line appends, which never need to know these tables exist. The FTS
+# rowid is the source row's rowid, so every sync is an indexed lookup.
+FTS_SCHEMA = """
+CREATE VIRTUAL TABLE IF NOT EXISTS transcripts_fts USING fts5(
+    title, body, tokenize='porter unicode61');
+CREATE VIRTUAL TABLE IF NOT EXISTS knowledge_fts USING fts5(
+    body, tokenize='porter unicode61');
+CREATE VIRTUAL TABLE IF NOT EXISTS sources_fts USING fts5(
+    body, notes, tokenize='porter unicode61');
+
+CREATE TRIGGER IF NOT EXISTS transcripts_fts_ai AFTER INSERT ON transcripts BEGIN
+    INSERT INTO transcripts_fts(rowid, title, body) VALUES (new.rowid, new.title, new.body);
+END;
+CREATE TRIGGER IF NOT EXISTS transcripts_fts_au AFTER UPDATE OF title, body ON transcripts BEGIN
+    DELETE FROM transcripts_fts WHERE rowid = old.rowid;
+    INSERT INTO transcripts_fts(rowid, title, body) VALUES (new.rowid, new.title, new.body);
+END;
+CREATE TRIGGER IF NOT EXISTS transcripts_fts_ad AFTER DELETE ON transcripts BEGIN
+    DELETE FROM transcripts_fts WHERE rowid = old.rowid;
+END;
+
+CREATE TRIGGER IF NOT EXISTS knowledge_fts_ai AFTER INSERT ON repo_knowledge BEGIN
+    INSERT INTO knowledge_fts(rowid, body) VALUES (new.id, new.insight);
+END;
+CREATE TRIGGER IF NOT EXISTS knowledge_fts_ad AFTER DELETE ON repo_knowledge BEGIN
+    DELETE FROM knowledge_fts WHERE rowid = old.id;
+END;
+
+CREATE TRIGGER IF NOT EXISTS sources_fts_ai AFTER INSERT ON sources BEGIN
+    INSERT INTO sources_fts(rowid, body, notes) VALUES (
+        new.id, CASE WHEN new.source_type = 'text' THEN new.reference ELSE '' END, new.notes);
+END;
+CREATE TRIGGER IF NOT EXISTS sources_fts_ad AFTER DELETE ON sources BEGIN
+    DELETE FROM sources_fts WHERE rowid = old.id;
+END;
+"""
+
+_FTS_BACKFILL = (
+    ("transcripts_fts", "transcripts",
+     "INSERT INTO transcripts_fts(rowid, title, body) SELECT rowid, title, body FROM transcripts"),
+    ("knowledge_fts", "repo_knowledge",
+     "INSERT INTO knowledge_fts(rowid, body) SELECT id, insight FROM repo_knowledge"),
+    ("sources_fts", "sources",
+     "INSERT INTO sources_fts(rowid, body, notes) SELECT id, "
+     "CASE WHEN source_type = 'text' THEN reference ELSE '' END, notes FROM sources"),
+)
+
+
+def fts_query(text: str) -> str:
+    """Free text → a safe FTS5 query: every word, OR-ed, each quoted (so
+    punctuation and FTS operators in the user's text can't break the query).
+    bm25 ranks documents matching more of the words higher."""
+    words = [w for w in re.findall(r"\w+", text.lower()) if len(w) > 1 or w.isdigit()]
+    seen, out = set(), []
+    for w in words:
+        if w not in seen:
+            seen.add(w)
+            out.append('"' + w + '"')
+    return " OR ".join(out)
 
 
 class Database:
@@ -74,6 +139,19 @@ class Database:
 
     def _create_tables(self):
         self.conn.executescript(SCHEMA)
+        # A transcripts table created by an older meeting-capture lacks the
+        # newest columns; add them in place.
+        cols = {r[1] for r in self.conn.execute("PRAGMA table_info(transcripts)")}
+        if "indexed_with" not in cols:
+            self.conn.execute("ALTER TABLE transcripts ADD COLUMN indexed_with TEXT NOT NULL DEFAULT ''")
+        self.conn.executescript(FTS_SCHEMA)
+        # First run with FTS (or rows written while it didn't exist): fill it.
+        for fts, table, fill in _FTS_BACKFILL:
+            n_fts = self.conn.execute(f"SELECT COUNT(*) FROM {fts}").fetchone()[0]
+            n_src = self.conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+            if n_fts != n_src:
+                self.conn.execute(f"DELETE FROM {fts}")
+                self.conn.execute(fill)
         self.conn.commit()
 
     # --- Tasks ---
@@ -233,23 +311,83 @@ class Database:
         ).fetchone()
         return dict(row) if row else None
 
-    def transcripts_to_index(self, settled_before: float) -> list[dict]:
-        """Transcripts changed since they were last indexed and quiet since
+    def transcripts_to_index(self, settled_before: float, embedding: str = "") -> list[dict]:
+        """Transcripts changed since they were last indexed — or indexed with
+        a different embedding model than `embedding` — and quiet since
         `settled_before` (a live meeting is still being appended to)."""
+        if embedding:
+            # Rows indexed before models were tracked were indexed with
+            # whatever was configured then; adopt the current one once.
+            self.conn.execute(
+                "UPDATE transcripts SET indexed_with = ? WHERE indexed_with = '' "
+                "AND indexed_at IS NOT NULL", (embedding,))
+            self.conn.commit()
         rows = self.conn.execute(
-            "SELECT * FROM transcripts WHERE (indexed_at IS NULL OR indexed_at < updated_at) "
-            "AND updated_at <= ? ORDER BY updated_at",
-            (settled_before,),
+            "SELECT * FROM transcripts WHERE (indexed_at IS NULL OR indexed_at < updated_at "
+            "OR (? != '' AND indexed_with != ?)) AND updated_at <= ? ORDER BY updated_at",
+            (embedding, embedding, settled_before),
         ).fetchall()
         return [dict(r) for r in rows]
 
-    def mark_transcript_indexed(self, meeting_id: str, as_of: float) -> None:
+    def mark_transcript_indexed(self, meeting_id: str, as_of: float, embedding: str = "") -> None:
         """`as_of` is the updated_at the index was built from, not the clock:
         a line appended mid-index leaves the row pending for the next pass."""
         self.conn.execute(
-            "UPDATE transcripts SET indexed_at = ? WHERE meeting_id = ?", (as_of, meeting_id)
+            "UPDATE transcripts SET indexed_at = ?, indexed_with = ? WHERE meeting_id = ?",
+            (as_of, embedding, meeting_id)
         )
         self.conn.commit()
+
+    # --- Full-text search ---
+
+    def search_text(self, query: str, limit: int = 10, meeting_id: str = "",
+                    after: str = "", before: str = "", project: str = "") -> list[dict]:
+        """Keyword search (FTS5, bm25-ranked, stemmed) over transcripts, repo
+        knowledge and text sources/notes. Works with no embedding model.
+        Date filters (ISO strings) apply to transcripts' start time and
+        restrict results to transcripts; `project` restricts to that
+        project's task sources."""
+        q = fts_query(query)
+        if not q:
+            return []
+        hits: list[dict] = []
+        if not project:
+            where, args = ["transcripts_fts MATCH ?"], [q]
+            if meeting_id:
+                where.append("t.meeting_id = ?"); args.append(meeting_id)
+            if after:
+                where.append("t.started_at >= ?"); args.append(after)
+            if before:
+                where.append("t.started_at <= ?"); args.append(before)
+            for r in self.conn.execute(
+                "SELECT t.meeting_id, t.title, t.started_at, bm25(transcripts_fts, 4.0, 1.0) AS rank, "
+                "snippet(transcripts_fts, 1, '', '', ' … ', 48) AS snip "
+                f"FROM transcripts_fts JOIN transcripts t ON t.rowid = transcripts_fts.rowid "
+                f"WHERE {' AND '.join(where)} ORDER BY rank LIMIT ?", (*args, limit)):
+                hits.append({"kind": "transcript", "meeting_id": r["meeting_id"], "title": r["title"],
+                             "started_at": r["started_at"], "text": r["snip"], "rank": r["rank"]})
+        if meeting_id or after or before:
+            return hits[:limit]
+        if not project:
+            for r in self.conn.execute(
+                "SELECT k.id, k.repo_url, k.insight, bm25(knowledge_fts) AS rank FROM knowledge_fts "
+                "JOIN repo_knowledge k ON k.id = knowledge_fts.rowid WHERE knowledge_fts MATCH ? "
+                "ORDER BY rank LIMIT ?", (q, limit)):
+                hits.append({"kind": "repo_knowledge", "repo_url": r["repo_url"], "text": r["insight"],
+                             "rank": r["rank"]})
+        where, args = ["sources_fts MATCH ?"], [q]
+        if project:
+            where.append("t.project = ?"); args.append(project)
+        for r in self.conn.execute(
+            "SELECT s.id, s.source_type, s.reference, s.notes, t.name AS task_name, "
+            "bm25(sources_fts) AS rank FROM sources_fts JOIN sources s ON s.id = sources_fts.rowid "
+            f"JOIN tasks t ON t.id = s.task_id WHERE {' AND '.join(where)} ORDER BY rank LIMIT ?",
+            (*args, limit)):
+            text = r["reference"] if r["source_type"] == "text" else f"{r['reference']} — {r['notes']}"
+            hits.append({"kind": "source", "task_name": r["task_name"], "source_type": r["source_type"],
+                         "text": text, "rank": r["rank"]})
+        hits.sort(key=lambda h: h["rank"])  # bm25: lower is better
+        return hits[:limit]
 
     def delete_transcript(self, meeting_id: str) -> bool:
         cur = self.conn.execute("DELETE FROM transcripts WHERE meeting_id = ?", (meeting_id,))

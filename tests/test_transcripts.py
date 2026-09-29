@@ -233,3 +233,86 @@ def test_text_only_bundle_import_just_stores(db, tmp_path):
     vs = VectorSearch(chroma_path=tmp_path / "chroma")
     stats = T.import_bundle(vs, db, f)
     assert stats["text_only"] and stats["stored"] == 1 and stats["pending"] == 1
+
+
+# ---- full-text search + embedding choice -----------------------------------
+
+def test_fts_finds_transcripts_immediately_including_raw_appends(db):
+    T.add_text(db, "[10:00:01] Jane: we decided to move Acme to annual billing",
+               title="Pricing sync", started_at="2026-09-28T10:00")
+    # meeting-capture appends straight to the table; triggers keep FTS current.
+    db.conn.execute("INSERT INTO transcripts (meeting_id, title, source, started_at, body, created_at, updated_at) "
+                    "VALUES ('meeting-2026-09-29T09-00-00', 'meeting-2026-09-29T09-00-00', 'meeting-capture', "
+                    "'2026-09-29T09:00:00', '# Meeting\n', 1, 1)")
+    db.conn.execute("UPDATE transcripts SET body = body || ? WHERE meeting_id = 'meeting-2026-09-29T09-00-00'",
+                    ("[09:00:05] **Them:** the Zephyr launch slips to November\n",))
+    db.conn.commit()
+    hits = db.search_text("decide annual billing")          # stemming: decide ~ decided
+    assert hits and hits[0]["title"] == "Pricing sync"
+    z = db.search_text("zephyr")
+    assert z and z[0]["meeting_id"] == "meeting-2026-09-29T09-00-00" and "November" in z[0]["text"]
+    assert db.search_text("zephyr", after="2026-09-30T00:00:00") == []
+    assert db.search_text("zephyr", meeting_id="other") == []
+    assert db.search_text('"; DROP TABLE x; --') == [] or True   # never a syntax error
+
+
+def test_fts_backfills_existing_rows_and_covers_knowledge_and_sources(tmp_path):
+    import sqlite3
+    path = tmp_path / "old.db"
+    old = sqlite3.connect(path)   # a DB from before FTS existed
+    old.executescript("CREATE TABLE repo_knowledge (id INTEGER PRIMARY KEY AUTOINCREMENT, repo_url TEXT NOT NULL, "
+                      "insight TEXT NOT NULL, created_at TEXT NOT NULL DEFAULT (datetime('now')));"
+                      "INSERT INTO repo_knowledge (repo_url, insight) VALUES ('r', 'run the flaky xcodebuild retry loop');")
+    old.commit(); old.close()
+    db = Database(db_path=path)
+    assert db.search_text("xcodebuild")[0]["kind"] == "repo_knowledge"
+    t = db.create_task("launch", project="p")
+    db.add_source(t["id"], "text", "Blink camera order ships Thursday", notes="")
+    assert db.search_text("blink camera", project="p")[0]["kind"] == "source"
+    assert db.search_text("blink camera", project="other") == []
+
+
+def test_embeddings_none_means_no_vector_index_and_fts_search(tmp_path, monkeypatch):
+    monkeypatch.setenv("CO_EMBEDDING_MODEL", "none")
+    vs = VectorSearch(chroma_path=tmp_path / "chroma")
+    assert not vs.enabled and vs.search("x") == [] and vs.count() == 0
+    db = Database(db_path=tmp_path / "c.db")
+    mid, _ = T.add_text(db, VTT, title="Jane", started_at="2026-09-28T14:00:00")
+    assert T.index_row(vs, db, db.get_transcript(mid)) == 0
+    assert db.count_transcripts() == (1, 0)
+    assert db.get_transcript(mid)["indexed_with"] == "none"
+
+
+def test_switching_models_uses_a_new_collection_and_reindexes(tmp_path, monkeypatch):
+    chroma = tmp_path / "chroma"
+    db = Database(db_path=tmp_path / "c.db")
+    mid, _ = T.add_text(db, VTT, title="Jane", started_at="2026-09-28T14:00:00")
+    monkeypatch.setenv("CO_EMBEDDING_MODEL", "local")
+    local = VectorSearch(chroma_path=chroma)
+    assert local.collection.name == "context"               # first model keeps the old name
+    assert T.index_pending(local, db, settle_seconds=0, now=time.time() + 5) == [mid]
+    assert T.index_pending(local, db, settle_seconds=0, now=time.time() + 5) == []
+
+    monkeypatch.setattr(local, "identity", "other-model")    # a second model (no download in tests)
+    monkeypatch.setattr(VectorSearch, "_connect", lambda self: None)
+    other = VectorSearch.__new__(VectorSearch)
+    other.chroma_path, other.enabled, other.identity = chroma, True, "other-model"
+    assert other._collection_name("other-model") == "context-other-model"
+    assert other._collection_name("default") == "context"    # switching back reuses the old one
+    # Rows embedded with "default" are pending for "other-model" only.
+    assert [r["meeting_id"] for r in db.transcripts_to_index(time.time() + 5, "other-model")] == [mid]
+    assert db.transcripts_to_index(time.time() + 5, "default") == []
+
+
+def test_contorch_memory_embeddings_writes_env_file(tmp_path, monkeypatch):
+    from context_orchestrator import settings
+    env = tmp_path / "env"
+    env.write_text("# my settings\nCO_RERANK_MODEL=gemini-flash-latest\nCO_EMBEDDING_MODEL=gemini-embedding-001\n")
+    monkeypatch.delenv("CO_EMBEDDING_MODEL", raising=False)
+    msg = settings.set_embeddings("none", env_file=env)
+    assert "keyword" in msg
+    text = env.read_text()
+    assert "CO_EMBEDDING_MODEL=none" in text and "CO_RERANK_MODEL=gemini-flash-latest" in text
+    assert text.count("CO_EMBEDDING_MODEL") == 1 and text.startswith("# my settings")
+    with pytest.raises(ValueError):
+        settings.set_embeddings("bogus", env_file=env)

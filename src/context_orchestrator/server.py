@@ -3,7 +3,7 @@ import os
 import logging
 import time
 from contextlib import asynccontextmanager
-from datetime import date
+from datetime import date, datetime
 from pathlib import Path
 
 import anyio
@@ -57,6 +57,9 @@ def _sync_index():
     eliminates the timing race where the background sync thread is mid-
     Gemini-call when an MCP tool request lands and the stdio pipe drops.
     """
+    if not vs.enabled:
+        logger.info("Embeddings off — nothing to sync to a vector index (full-text search only)")
+        return
     existing_ids = set(vs.collection.get(include=[])["ids"])
     rk_ids = {f"repo_knowledge:{r[0]}" for r in db.conn.execute(
         "SELECT id FROM repo_knowledge").fetchall()}
@@ -615,7 +618,7 @@ def search(
     # When filters are in play, hybrid is incompatible (BM25 is unfiltered).
     # Otherwise default to hybrid + MMR for best general-purpose ranking.
     use_hybrid = where is None
-    hits = vs.search(
+    dense = vs.search(
         query,
         n_results=10,
         where=where,
@@ -624,29 +627,58 @@ def search(
         mmr_lambda=0.7,
         rerank=rerank,
     )
-    if not hits:
+    if not dense and project and where:
         # Fallback: drop the project filter (repo knowledge isn't project-scoped)
-        if project and where:
-            other_filters = [f for f in filters if "project" not in f]
-            fallback_where = (
-                None if not other_filters
-                else other_filters[0] if len(other_filters) == 1
-                else {"$and": other_filters}
-            )
-            hits = vs.search(
-                query,
-                n_results=10,
-                where=fallback_where,
-                hybrid=fallback_where is None,
-                mmr=True,
-                mmr_lambda=0.7,
-                rerank=rerank,
-            )
-        if not hits:
-            return f"No results for '{query}'."
+        other_filters = [f for f in filters if "project" not in f]
+        fallback_where = (
+            None if not other_filters
+            else other_filters[0] if len(other_filters) == 1
+            else {"$and": other_filters}
+        )
+        dense = vs.search(
+            query,
+            n_results=10,
+            where=fallback_where,
+            hybrid=fallback_where is None,
+            mmr=True,
+            mmr_lambda=0.7,
+            rerank=rerank,
+        )
+
+    # Full-text search (SQLite FTS5) runs alongside: it needs no embedding
+    # model, finds a transcript the moment it's stored, and nails exact
+    # names / numbers. It is the whole search when embeddings are off.
+    def _iso(s: str) -> str:
+        ts = _parse_iso_date(s) if s else None
+        return datetime.fromtimestamp(ts).isoformat(timespec="seconds") if ts is not None else ""
+    try:
+        text_hits = db.search_text(query, limit=10, meeting_id=meeting_id,
+                                   after=_iso(after_date), before=_iso(before_date), project=project)
+        if not text_hits and project:
+            text_hits = db.search_text(query, limit=10, meeting_id=meeting_id,
+                                       after=_iso(after_date), before=_iso(before_date))
+    except Exception:
+        logger.exception("full-text search failed")
+        text_hits = []
+
+    hits = _fuse(dense, text_hits, limit=10)
+    if not hits:
+        return f"No results for '{query}'."
 
     lines = [f"Search results for '{query}':"]
     for h in hits:
+        if h.get("fts"):
+            if h["kind"] == "transcript":
+                title = h.get("title") or ""
+                title = f" ({title})" if title and title != h["meeting_id"] else ""
+                when = f"{h['started_at']} " if h.get("started_at") else ""
+                snip = " ".join(h["text"].split())
+                lines.append(f"  [transcript: {h['meeting_id']}{title}] {when}{snip[:300]}")
+            elif h["kind"] == "repo_knowledge":
+                lines.append(f"  [repo: {h['repo_url']}] {h['text']}")
+            else:
+                lines.append(f"  [task: {h['task_name']}] ({h['source_type']}) {h['text'][:200]}")
+            continue
         meta = h["metadata"]
         doc_type = meta.get("type", "unknown")
 
@@ -674,8 +706,36 @@ def search(
             )
         else:
             lines.append(f"  [{doc_type}] {h['text'][:200]}")
-
+    if not vs.enabled:
+        lines.append("  (keyword search — embeddings are off; `contorch-memory embeddings` to change)")
     return "\n".join(lines)
+
+
+def _fuse(dense: list[dict], text_hits: list[dict], limit: int, k: int = 60) -> list[dict]:
+    """Reciprocal-rank fusion of vector hits and full-text hits. A transcript
+    found by both counts once, shown as the vector chunk (it carries the
+    chunk's own timestamp)."""
+    def key_dense(h):
+        m = h.get("metadata", {})
+        return f"t:{m['meeting_id']}" if m.get("type") == "transcript" and m.get("meeting_id") else f"d:{h['id']}"
+
+    def key_text(h):
+        if h["kind"] == "transcript":
+            return f"t:{h['meeting_id']}"
+        return f"f:{h['kind']}:{h['text'][:80]}"
+
+    scores: dict[str, float] = {}
+    items: dict[str, dict] = {}
+    for rank, h in enumerate(dense):
+        key = key_dense(h)
+        scores[key] = scores.get(key, 0.0) + 1.0 / (k + rank + 1)
+        items.setdefault(key, h)
+    for rank, h in enumerate(text_hits):
+        key = key_text(h)
+        scores[key] = scores.get(key, 0.0) + 1.0 / (k + rank + 1)
+        items.setdefault(key, {**h, "fts": True})
+    order = sorted(scores, key=lambda x: -scores[x])
+    return [items[x] for x in order[:limit]]
 
 
 def main():

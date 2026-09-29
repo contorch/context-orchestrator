@@ -96,6 +96,18 @@ The vector index is served by a `chroma run` HTTP daemon (launchd-managed) liste
 | `context-orchestrator-chroma install` | Install and start the launchd agent |
 | `context-orchestrator-chroma uninstall` | Stop and remove the launchd agent |
 
+### Search: full-text always, embeddings by choice
+
+`search` combines two retrievers. **Full-text search** (SQLite FTS5, English stemming) is always on: every transcript, repo insight and text source is keyword-searchable the moment it is stored, with no model, key or network — kept current by triggers, including meeting-capture's live appends. **Embeddings** add meaning-based matching, and are a setup choice:
+
+| `contorch-memory embeddings …` | Understands | Needs |
+|---|---|---|
+| `gemini` | paraphrases best | a Gemini key; text is sent to Google to embed |
+| `local` | paraphrases, less well | nothing — all-MiniLM-L6-v2 runs on this Mac (~80 MB, downloaded once) |
+| `none` | exact words (stemmed) | nothing — nothing leaves this Mac |
+
+The choice is stored in `~/.context-orchestrator/env`; `contorch-memory status` shows it with counts. Each model gets its own Chroma collection and each transcript records which model embedded it, so switching re-embeds from the stored text (next search, or `contorch-transcripts reindex`) and switching back reuses the old vectors. Machines exchanging embedding bundles must use the same choice. The Contorch menu bar shows the mode on its Index line.
+
 ### Transcripts
 
 Every transcript is a row in the `transcripts` table (full text in `body`); Chroma holds only the index built from it. The text is stored before anything is embedded, so a failing embedding call (bad key, quota, offline) loses nothing — the row stays pending and is indexed on a later `search`. A meeting still being appended to by meeting-capture is indexed once it has been quiet for 60 s.

@@ -1,3 +1,4 @@
+import json
 import logging
 import os
 import re
@@ -79,6 +80,26 @@ def _resolve_gemini_api_key() -> Optional[str]:
     return None
 
 
+def embedding_choice() -> str:
+    """The configured embedding model, normalised:
+      "none"                 → no embeddings; search is full-text (FTS5) only
+      "local"                → Chroma's built-in all-MiniLM-L6-v2 (offline, 384d)
+      "gemini-embedding-001" → Gemini (needs a key; "gemini" is an alias)
+      any other name         → a sentence-transformers model
+      ""                     → unset: Gemini if a key + google-genai exist, else local
+    Set with `contorch-memory embeddings gemini|local|none`
+    (~/.context-orchestrator/env)."""
+    v = (os.environ.get(EMBEDDING_MODEL_ENV) or "").strip()
+    low = v.lower()
+    if low in ("none", "fts", "keyword"):
+        return "none"
+    if low in ("off", "default", "local"):   # "off" meant "not Gemini" before 0.4
+        return "local"
+    if low == "gemini":
+        return "gemini-embedding-001"
+    return v
+
+
 def _build_embedding_function():
     """Construct a Chroma EmbeddingFunction for the user-configured model.
 
@@ -96,9 +117,11 @@ def _build_embedding_function():
     long as the key file is present, both will pick Gemini. Setting
     CO_EMBEDDING_MODEL=off explicitly opts out.
     """
-    model_name = os.environ.get(EMBEDDING_MODEL_ENV)
-    if model_name and model_name.lower() in ("off", "none", "default", "local"):
-        logger.info(f"{EMBEDDING_MODEL_ENV}={model_name}: forcing chroma default (local 384d)")
+    model_name = embedding_choice()
+    if model_name == "none":
+        raise RuntimeError("embeddings are turned off (CO_EMBEDDING_MODEL=none)")
+    if model_name == "local":
+        logger.info(f"{EMBEDDING_MODEL_ENV}=local: chroma default (all-MiniLM-L6-v2, 384d)")
         return None
     if not model_name:
         # Auto-detect Gemini availability
@@ -348,6 +371,12 @@ def _embedded_path_if_no_server() -> Optional[Path]:
     return None if LAUNCHD_PLIST.exists() else DEFAULT_CHROMA_PATH
 
 
+def ef_identity(ef) -> str:
+    """Stable name of an embedding function — tags bundles, names the
+    collection, and records which model indexed each transcript."""
+    return ef.name() if ef is not None and hasattr(ef, "name") else "default"
+
+
 def _matches_where(meta: dict, where: dict) -> bool:
     """Evaluate the subset of Chroma `where` syntax that search() produces."""
     if "$and" in where:
@@ -398,13 +427,22 @@ class VectorSearch:
         else:
             self.host = host or os.environ.get("CO_CHROMA_HOST", DEFAULT_CHROMA_HOST)
             self.port = int(port if port is not None else os.environ.get("CO_CHROMA_PORT", DEFAULT_CHROMA_PORT))
-        self._connect()
         # Lazy BM25 index — built on first hybrid search, refreshed when
         # the caller invalidates explicitly.
         self._bm25 = None
         self._bm25_ids: list[str] = []
+        # CO_EMBEDDING_MODEL=none: no vector index at all. Every method is a
+        # no-op / empty; search runs on SQLite full-text search instead.
+        self.enabled = embedding_choice() != "none"
+        if not self.enabled:
+            self.identity = "none"
+            self.collection = None
+            logger.info("Vector search off (CO_EMBEDDING_MODEL=none) — full-text search only")
+            return
+        self._connect()
         target = str(self.chroma_path) if self.chroma_path else f"http://{self.host}:{self.port}"
-        logger.info(f"Vector search initialized at {target} ({self.collection.count()} docs)")
+        logger.info(f"Vector search initialized at {target}, collection {self.collection.name!r} "
+                    f"for {self.identity} ({self.collection.count()} docs)")
         self._verify_embedding_dim()
 
     def _verify_embedding_dim(self) -> None:
@@ -413,7 +451,7 @@ class VectorSearch:
         upserts go through OK but every query returns a 400. Surface it
         loudly at startup with the exact remediation steps.
         """
-        if self.collection.count() == 0:
+        if not self.enabled or self.collection.count() == 0:
             return  # Empty collection takes whatever the EF produces.
         try:
             stored = self.collection.get(limit=1, include=["embeddings"])
@@ -449,14 +487,41 @@ class VectorSearch:
             self.client = chromadb.PersistentClient(path=str(self.chroma_path))
         else:
             self.client = self._http_client_with_retry()
+        ef = _build_embedding_function()
+        self.identity = ef_identity(ef)
         kwargs: dict = {
-            "name": "context",
+            "name": self._collection_name(self.identity),
             "metadata": {"hnsw:space": "cosine"},
         }
-        ef = _build_embedding_function()
         if ef is not None:
             kwargs["embedding_function"] = ef
         self.collection = self.client.get_or_create_collection(**kwargs)
+
+    def _collection_name(self, identity: str) -> str:
+        """One collection per embedding model, so switching models never mixes
+        vector spaces and switching back reuses the old vectors. The first
+        model seen keeps the historical name "context" (existing installs
+        keep their index); later ones get "context-<model>". The mapping lives
+        next to the Chroma data."""
+        base = self.chroma_path or DEFAULT_CHROMA_PATH
+        map_file = Path(base) / "contorch-collections.json"
+        try:
+            mapping = json.loads(map_file.read_text())
+        except (OSError, ValueError):
+            mapping = {}
+        if identity in mapping:
+            return mapping[identity]
+        if "context" in mapping.values():
+            name = "context-" + re.sub(r"[^a-zA-Z0-9._-]+", "-", identity).strip("-._")[:50]
+        else:
+            name = "context"   # fresh install, or the pre-0.4 collection built by this model
+        mapping[identity] = name
+        try:
+            map_file.parent.mkdir(parents=True, exist_ok=True)
+            map_file.write_text(json.dumps(mapping, indent=2, sort_keys=True))
+        except OSError:
+            pass
+        return name
 
     def _http_client_with_retry(self):
         """Retry chromadb.HttpClient with exponential backoff.
@@ -493,6 +558,8 @@ class VectorSearch:
 
     def reload(self) -> None:
         """Reconnect to disk so writes from other processes (e.g. the watcher) become visible."""
+        if not self.enabled:
+            return
         self._connect()
         # Underlying corpus may have changed — drop cached BM25 index.
         self._bm25 = None
@@ -529,6 +596,8 @@ class VectorSearch:
 
     def add(self, doc_id: str, text: str, metadata: dict) -> None:
         """Add or update a document in the vector index."""
+        if not self.enabled:
+            return
         self.collection.upsert(
             ids=[doc_id],
             documents=[text],
@@ -537,6 +606,8 @@ class VectorSearch:
 
     def remove(self, doc_id: str) -> None:
         """Remove a document from the vector index."""
+        if not self.enabled:
+            return
         try:
             self.collection.delete(ids=[doc_id])
         except Exception:
@@ -579,6 +650,8 @@ class VectorSearch:
                 env var, e.g. "gemini-flash-latest"). Soft-fails to base
                 ranking if the model can't be reached or no key is set.
         """
+        if not self.enabled:
+            return []
         try:
             return self._search(query, n_results, where, mmr, mmr_lambda, hybrid,
                                 rerank, rerank_model)
@@ -793,4 +866,4 @@ class VectorSearch:
         return out
 
     def count(self) -> int:
-        return self.collection.count()
+        return self.collection.count() if self.enabled else 0
