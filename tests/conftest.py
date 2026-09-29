@@ -26,3 +26,8 @@ def _no_real_gemini_key(monkeypatch, tmp_path):
     monkeypatch.delenv("GOOGLE_API_KEY", raising=False)
     monkeypatch.delenv("GEMINI_API_KEY", raising=False)
     monkeypatch.setattr(search, "GEMINI_KEY_FILE", tmp_path / "no-gemini-key")
+    # Same for the embedding choice: code under test may set it (e.g.
+    # `contorch-memory embeddings none`); setenv-then-delenv makes monkeypatch
+    # restore the original state afterwards, so it can't leak between tests.
+    monkeypatch.setenv("CO_EMBEDDING_MODEL", "")
+    monkeypatch.delenv("CO_EMBEDDING_MODEL")

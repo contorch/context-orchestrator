@@ -163,6 +163,8 @@ def _replace_chunks(vs, meeting_id: str, ids: list[str], docs: list[str], metas:
                     embeddings: Optional[list] = None) -> None:
     """Upsert the new chunks first, then drop leftovers. If the upsert fails
     (embedding error) the meeting's previous chunks stay searchable."""
+    if not vs.enabled:
+        return
     if ids:
         kwargs = {"ids": ids, "documents": docs, "metadatas": metas}
         if embeddings is not None:
@@ -176,10 +178,16 @@ def _replace_chunks(vs, meeting_id: str, ids: list[str], docs: list[str], metas:
 
 
 def index_row(vs, db, row: dict) -> int:
+    """Embed one transcript into the current model's collection. With
+    embeddings off there is nothing to embed (full-text search already has
+    it); the row is just marked as done for "none"."""
+    if not vs.enabled:
+        db.mark_transcript_indexed(row["meeting_id"], row["updated_at"], "none")
+        return 0
     chunks = chunks_for(row)
     _replace_chunks(vs, row["meeting_id"], [c[0] for c in chunks], [c[1] for c in chunks],
                     [c[2] for c in chunks])
-    db.mark_transcript_indexed(row["meeting_id"], row["updated_at"])
+    db.mark_transcript_indexed(row["meeting_id"], row["updated_at"], vs.identity)
     return len(chunks)
 
 
@@ -190,7 +198,7 @@ def index_pending(vs, db, settle_seconds: float = SETTLE_SECONDS,
     now = time.time() if now is None else now
     done: list[str] = []
     failures = 0
-    for row in db.transcripts_to_index(now - settle_seconds):
+    for row in db.transcripts_to_index(now - settle_seconds, vs.identity):
         try:
             index_row(vs, db, row)
         except Exception as exc:
@@ -206,6 +214,8 @@ def index_pending(vs, db, settle_seconds: float = SETTLE_SECONDS,
 
 
 def remove_from_index(vs, meeting_id: str) -> None:
+    if not vs.enabled:
+        return
     ids = vs.collection.get(where={"meeting_id": meeting_id}, include=[])["ids"]
     if ids:
         vs.collection.delete(ids=ids)
@@ -294,7 +304,8 @@ def iter_text_files(path: Path) -> Iterator[tuple[str, str, dt.datetime, Optiona
 # ---- embedding bundles ------------------------------------------------------
 
 def _ef_identity(ef) -> str:
-    return ef.name() if ef is not None and hasattr(ef, "name") else "chroma-default"
+    from .search import ef_identity
+    return ef_identity(ef)
 
 
 def write_bundle(rows: Iterable[dict], out: io.TextIOBase, ef) -> int:
@@ -356,7 +367,7 @@ def is_bundle(path: Path) -> bool:
 
 
 def _collection_dim(vs) -> Optional[int]:
-    if vs.collection.count() == 0:
+    if not vs.enabled or vs.collection.count() == 0:
         return None
     got = vs.collection.get(limit=1, include=["embeddings"]).get("embeddings")
     return len(got[0]) if got is not None and len(got) else None
@@ -369,7 +380,7 @@ def import_bundle(vs, db, path: Path) -> dict:
     stats = {"stored": 0, "unchanged": 0, "vectors_loaded": 0, "pending": 0}
     with path.open(encoding="utf-8") as f:
         header = json.loads(f.readline())
-        local_ef = _ef_identity(vs.collection._embedding_function)
+        local_ef = _ef_identity(vs.collection._embedding_function) if vs.enabled else "none"
         local_dim = _collection_dim(vs)
         text_only = header.get("embedding_function") is None
         compatible = not text_only and header.get("embedding_function") == local_ef and (
@@ -391,13 +402,14 @@ def import_bundle(vs, db, path: Path) -> dict:
                                         content_sha=content_sha(rec["body"]))
             stats["stored" if changed else "unchanged"] += 1
             row = db.get_transcript(mid)
-            if row["indexed_at"] is not None and row["indexed_at"] >= row["updated_at"]:
-                continue  # already indexed from this exact text
+            if (row["indexed_at"] is not None and row["indexed_at"] >= row["updated_at"]
+                    and row.get("indexed_with") == vs.identity):
+                continue  # already indexed from this exact text, with this model
             if compatible and rec.get("chunks") is not None:
                 ch = rec["chunks"]
                 _replace_chunks(vs, mid, [c["id"] for c in ch], [c["text"] for c in ch],
                                 [c["metadata"] for c in ch], [c["embedding"] for c in ch])
-                db.mark_transcript_indexed(mid, row["updated_at"])
+                db.mark_transcript_indexed(mid, row["updated_at"], vs.identity)
                 stats["vectors_loaded"] += 1
             else:
                 stats["pending"] += 1

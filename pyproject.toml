@@ -14,6 +14,7 @@ dependencies = [
 [project.scripts]
 save-transcript = "context_orchestrator.cli:main"
 contorch-transcripts = "context_orchestrator.transcripts:main"
+contorch-memory = "context_orchestrator.settings:main"
 transcript-watcher = "context_orchestrator.watcher:main"
 context-orchestrator-chroma = "context_orchestrator.chroma_daemon:main"
 # The MCP server as a real executable, so a packaged install (Homebrew) can
