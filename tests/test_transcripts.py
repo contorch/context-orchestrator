@@ -106,9 +106,13 @@ def test_import_dir_delete_removes_only_stored_settled_files(db, tmp_path):
     os.utime(old, (past, past))
     live = d / "meeting-2026-09-28T10-00-00.md"
     live.write_text("[10:00:01] **Them:** still being written")
-    stats = T.import_path(db, d, delete=True)
+    stats = T.import_path(db, d, delete=True, backup_dir=tmp_path / "backups")
+    backup = stats.pop("backup")
     assert stats == {"stored": 1, "unchanged": 0, "deleted": 1, "skipped_live": 1}
     assert not old.exists() and live.exists()
+    with zipfile.ZipFile(backup) as z:                  # the deleted file, intact
+        assert z.namelist() == ["meeting-2026-05-01T10-00-00.md"]
+        assert z.read("meeting-2026-05-01T10-00-00.md") == b"[10:00:01] **Them:** the old meeting text"
     assert "old meeting text" in db.get_transcript("meeting-2026-05-01T10-00-00")["body"]
 
 
@@ -316,3 +320,37 @@ def test_contorch_memory_embeddings_writes_env_file(tmp_path, monkeypatch):
     assert text.count("CO_EMBEDDING_MODEL") == 1 and text.startswith("# my settings")
     with pytest.raises(ValueError):
         settings.set_embeddings("bogus", env_file=env)
+
+
+
+def test_failed_backup_deletes_nothing(db, tmp_path, monkeypatch):
+    d = tmp_path / "transcripts"; d.mkdir()
+    import os
+    for i in range(3):
+        f = d / f"meeting-2026-05-0{i+1}T10-00-00.md"
+        f.write_text(f"[10:00:01] **Me:** meeting number {i}")
+        os.utime(f, (time.time() - 600, time.time() - 600))
+    real = zipfile.ZipFile.read
+    monkeypatch.setattr(zipfile.ZipFile, "read", lambda self, name: b"corrupted")   # verify fails
+    with pytest.raises(T.BackupError):
+        T.import_path(db, d, delete=True, backup_dir=tmp_path / "backups")
+    monkeypatch.setattr(zipfile.ZipFile, "read", real)
+    assert len(list(d.glob("*.md"))) == 3, "no file may be deleted when the backup fails"
+    assert list((tmp_path / "backups").glob("*.zip")) == []          # no half-written backup left
+    assert db.count_transcripts()[0] == 3                              # the import itself happened
+
+
+def test_cli_rm_keeps_the_text_in_a_backup(tmp_path, monkeypatch, capsys):
+    monkeypatch.setenv("CO_DB_PATH", str(tmp_path / "c.db"))
+    monkeypatch.setenv("CO_CHROMA_PATH", str(tmp_path / "chroma"))
+    monkeypatch.setattr(T, "BACKUP_DIR", tmp_path / "backups")
+    f = tmp_path / "ep.txt"; f.write_text("[14:00:01] Host: the secret number is 42")
+    T.main(["add", str(f), "--title", "Ep", "--started-at", "2026-09-28T14:00"])
+    capsys.readouterr()
+    assert T.main(["rm", "2026-09-28-1400-ep"]) == 0
+    assert "kept in" in capsys.readouterr().out
+    with zipfile.ZipFile(tmp_path / "backups" / "deleted-transcripts.zip") as z:
+        (name,) = z.namelist()
+        assert name.startswith("2026-09-28-1400-ep-deleted-")
+        assert b"the secret number is 42" in z.read(name)
+    assert T.main(["show", "2026-09-28-1400-ep"]) == 1

@@ -60,7 +60,7 @@ timestamps. A transcript that was summarised on the way in is worse than none.
   `after_date`/`before_date` for time windows.
 - Need the whole conversation around a hit → `get_transcript(meeting_id)` (or `"$CT" show <id>`).
 - What's stored → `list_transcripts()` (or `"$CT" list`).
-- Delete → only on explicit request: `"$CT" rm <id>` (removes the row and its index entries).
+- Delete → only on explicit request: `"$CT" rm <id>` (removes the row and its index entries; the text is saved to `~/.context-orchestrator/backups/deleted-transcripts.zip` first). `import <dir> --delete` zips the files it removes into `~/.context-orchestrator/backups/` and verifies the zip before deleting anything — tell the user the backup path it prints.
 
 ## Embedding on another machine
 
