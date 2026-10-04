@@ -27,9 +27,11 @@ def index_file_content(vs: VectorSearch, source_id: int, file_path: str,
 
     chunks = chunk_text(content)
 
-    for i, chunk in enumerate(chunks):
-        doc_id = f"file_chunk:{source_id}:{i}"
-        vs.add(doc_id, chunk, {
+    # One upsert (one Chroma session) for the whole file.
+    vs.upsert(
+        [f"file_chunk:{source_id}:{i}" for i in range(len(chunks))],
+        list(chunks),
+        [{
             "type": "file_chunk",
             "source_id": str(source_id),
             "chunk_index": i,
@@ -38,6 +40,7 @@ def index_file_content(vs: VectorSearch, source_id: int, file_path: str,
             "filename": path.name,
             "task_name": task_name,
             "project": project,
-        })
+        } for i in range(len(chunks))],
+    )
 
     return len(chunks)

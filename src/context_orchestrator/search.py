@@ -1,3 +1,4 @@
+import contextlib
 import json
 import logging
 import os
@@ -5,7 +6,7 @@ import re
 from pathlib import Path
 from typing import Optional
 
-import chromadb
+from .chroma_lock import DEFAULT_TIMEOUT_S, LockTimeout, lock_path_for, session_lock
 
 logger = logging.getLogger("context-orchestrator")
 
@@ -400,15 +401,66 @@ def _matches_where(meta: dict, where: dict) -> bool:
     return True
 
 
-class VectorSearch:
-    """Connects to Chroma. Two modes:
+INDEX_STAMP_FILE = "contorch-index.json"
 
-    - HTTP (default): connects to a `chroma run` daemon. Multiple processes can
-      share one index without SQLite-lock contention. Override host/port via the
-      `CO_CHROMA_HOST` / `CO_CHROMA_PORT` env vars.
-    - Local persistent (tests, migration): pass `chroma_path` to use a
-      `PersistentClient` against an on-disk directory. Same on-disk format as
-      the daemon, so data is portable between modes.
+
+def chromadb_version() -> Optional[str]:
+    """The chromadb installed for THIS interpreter, from its dist-info (no
+    import of chromadb itself)."""
+    try:
+        from importlib.metadata import PackageNotFoundError, version
+        return version("chromadb")
+    except Exception:  # PackageNotFoundError, or a broken dist-info
+        return None
+
+
+def read_index_stamp(chroma_path: Path) -> dict:
+    """`<chroma>/contorch-index.json`: which chromadb last wrote this folder."""
+    try:
+        return json.loads((Path(chroma_path) / INDEX_STAMP_FILE).read_text())
+    except (OSError, ValueError):
+        return {}
+
+
+def _write_index_stamp(chroma_path: Path) -> None:
+    """Record the writing chromadb version. Called inside the session lock
+    after every write; rewritten only when it changes."""
+    stamp = {"schema": "contorch-index/1", "chromadb_version": chromadb_version()}
+    if read_index_stamp(chroma_path) == stamp:
+        return
+    target = Path(chroma_path) / INDEX_STAMP_FILE
+    tmp = target.with_name(f".{INDEX_STAMP_FILE}.{os.getpid()}.tmp")
+    try:
+        tmp.write_text(json.dumps(stamp, indent=2, sort_keys=True))
+        os.replace(tmp, target)
+    except OSError as exc:
+        logger.warning("could not write %s: %s", target, exc)
+
+
+def _clear_chroma_system_cache() -> None:
+    """chromadb keeps one System per path for the life of the process
+    (SharedSystemClient._identifier_to_system). Dropping it is what makes the
+    next PersistentClient re-read the folder instead of serving a stale (and,
+    for writers, divergent) in-memory index."""
+    from chromadb.api.shared_system_client import SharedSystemClient
+    SharedSystemClient.clear_system_cache()
+
+
+class VectorSearch:
+    """The vector index (Chroma). Two modes:
+
+    - HTTP: talks to the `context-orchestrator-chroma` server (launchd) or
+      CO_CHROMA_HOST/PORT. The server serialises access itself, so one
+      long-lived client is fine.
+    - In-process (a lightweight install with no server, CO_CHROMA_PATH, tests):
+      a PersistentClient on a folder that several processes open. chromadb is
+      not process-safe there, so EVERY operation runs in a session
+      (`with vs.session() as col:`): take the cross-process lock
+      (chroma_lock), drop chromadb's cached System, open fresh, operate, drop,
+      unlock. No client is held between sessions. Embeddings (the slow, and
+      for Gemini networked, part) are computed BEFORE the lock is taken.
+
+    `vs.collection` is only valid inside a session in in-process mode.
     """
 
     def __init__(
@@ -416,34 +468,150 @@ class VectorSearch:
         chroma_path: Optional[Path] = None,
         host: Optional[str] = None,
         port: Optional[int] = None,
+        lock_timeout: Optional[float] = DEFAULT_TIMEOUT_S,
+        verify: bool = True,
     ):
         if chroma_path is None and host is None and port is None:
             chroma_path = _embedded_path_if_no_server()
-        self.chroma_path = chroma_path
-        if chroma_path is not None:
+        self.chroma_path = Path(chroma_path) if chroma_path is not None else None
+        self.lock_timeout = lock_timeout
+        if self.chroma_path is not None:
             self.host = None
             self.port = None
-            chroma_path.mkdir(parents=True, exist_ok=True)
+            self.chroma_path.mkdir(parents=True, exist_ok=True)
+            self.lock_path: Optional[Path] = lock_path_for(self.chroma_path)
         else:
             self.host = host or os.environ.get("CO_CHROMA_HOST", DEFAULT_CHROMA_HOST)
             self.port = int(port if port is not None else os.environ.get("CO_CHROMA_PORT", DEFAULT_CHROMA_PORT))
+            self.lock_path = None
         # Lazy BM25 index — built on first hybrid search, refreshed when
         # the caller invalidates explicitly.
         self._bm25 = None
         self._bm25_ids: list[str] = []
+        self._col = None            # the open collection (HTTP: always; in-process: inside a session)
+        self._client = None
+        self._name: Optional[str] = None
+        self._default_ef = None
+        self._session_wrote = False
         # CO_EMBEDDING_MODEL=none: no vector index at all. Every method is a
         # no-op / empty; search runs on SQLite full-text search instead.
         self.enabled = embedding_choice() != "none"
         if not self.enabled:
             self.identity = "none"
-            self.collection = None
+            self._ef = None
             logger.info("Vector search off (CO_EMBEDDING_MODEL=none) — full-text search only")
             return
-        self._connect()
-        target = str(self.chroma_path) if self.chroma_path else f"http://{self.host}:{self.port}"
-        logger.info(f"Vector search initialized at {target}, collection {self.collection.name!r} "
-                    f"for {self.identity} ({self.collection.count()} docs)")
-        self._verify_embedding_dim()
+        self._ef = _build_embedding_function()
+        self.identity = ef_identity(self._ef)
+        if self.chroma_path is None:
+            self._connect()
+            logger.info(f"Vector search initialized at http://{self.host}:{self.port}, collection "
+                        f"{self._col.name!r} for {self.identity} ({self._col.count()} docs)")
+        else:
+            logger.info(f"Vector search in-process at {self.chroma_path} for {self.identity} "
+                        f"(session lock {self.lock_path})")
+        if verify:
+            self._verify_embedding_dim()
+
+    # ---- sessions ------------------------------------------------------------
+
+    @property
+    def in_process(self) -> bool:
+        return self.chroma_path is not None
+
+    @property
+    def collection(self):
+        """The Chroma collection. In-process mode: only inside `session()`."""
+        if self.in_process and self._col is None and self.enabled:
+            raise RuntimeError("VectorSearch.collection used outside `with vs.session():` "
+                               "(in-process Chroma must not be touched without the session lock)")
+        return self._col
+
+    @property
+    def collection_name(self) -> Optional[str]:
+        if not self.enabled:
+            return None
+        if self._name is None:
+            self._name = self._collection_name(self.identity)
+        return self._name
+
+    @contextlib.contextmanager
+    def session(self, write: bool = False, timeout: Optional[float] = None):
+        """Yield the collection with exclusive access (in-process mode) or the
+        long-lived HTTP collection. `write=True` stamps the chromadb version
+        into the folder when the session ends. Raises chroma_lock.LockTimeout
+        if the lock can't be had within `timeout` (default: self.lock_timeout)."""
+        if not self.enabled:
+            yield None
+            return
+        if not self.in_process:
+            yield self._col
+            return
+        if self._col is not None:          # nested session of this instance
+            self._session_wrote = self._session_wrote or write
+            yield self._col
+            return
+        to = self.lock_timeout if timeout is None else timeout
+        with session_lock(self.lock_path, timeout=to,
+                          on_first_acquire=_clear_chroma_system_cache,
+                          on_last_release=_clear_chroma_system_cache):
+            self._session_wrote = write
+            try:
+                self._open_local()
+                yield self._col
+            finally:
+                try:
+                    if self._session_wrote:
+                        _write_index_stamp(self.chroma_path)
+                finally:
+                    self._col = None
+                    self._client = None
+                    self._session_wrote = False
+
+    def _open_local(self) -> None:
+        import chromadb
+        self._client = chromadb.PersistentClient(path=str(self.chroma_path))
+        self._col = self._client.get_or_create_collection(**self._collection_kwargs())
+
+    def _collection_kwargs(self) -> dict:
+        kwargs: dict = {"name": self.collection_name, "metadata": {"hnsw:space": "cosine"}}
+        if self._ef is not None:
+            kwargs["embedding_function"] = self._ef
+        return kwargs
+
+    def _connect(self) -> None:
+        """HTTP mode: one long-lived client (the server serialises access)."""
+        self._client = self._http_client_with_retry()
+        self._col = self._client.get_or_create_collection(**self._collection_kwargs())
+
+    # ---- embeddings (always computed outside the lock) ------------------------
+
+    @property
+    def embedding_function(self):
+        """The function that makes this collection's vectors (Chroma's
+        built-in MiniLM when no model is configured)."""
+        if self._ef is not None:
+            return self._ef
+        if self._default_ef is None:
+            from chromadb.utils.embedding_functions import DefaultEmbeddingFunction
+            self._default_ef = DefaultEmbeddingFunction()
+        return self._default_ef
+
+    def embed_documents(self, texts: list[str]) -> list:
+        """Document vectors, exactly as Chroma would compute them at upsert."""
+        if not texts:
+            return []
+        return [list(map(float, v)) for v in self.embedding_function(input=list(texts))]
+
+    def embed_query(self, text: str) -> list:
+        """A query vector, exactly as Chroma would compute it at query time
+        (Gemini uses a different task type for queries)."""
+        ef = self.embedding_function
+        if hasattr(ef, "embed_query"):
+            out = ef.embed_query(input=[text])
+        else:
+            out = ef(input=[text])
+        return list(map(float, out[0]))
 
     def _verify_embedding_dim(self) -> None:
         """Compare the configured EF's output dim against the dim of vectors
@@ -451,10 +619,13 @@ class VectorSearch:
         upserts go through OK but every query returns a 400. Surface it
         loudly at startup with the exact remediation steps.
         """
-        if not self.enabled or self.collection.count() == 0:
-            return  # Empty collection takes whatever the EF produces.
+        if not self.enabled:
+            return
         try:
-            stored = self.collection.get(limit=1, include=["embeddings"])
+            with self.session() as col:
+                if col.count() == 0:
+                    return  # Empty collection takes whatever the EF produces.
+                stored = col.get(limit=1, include=["embeddings"])
             embs = stored.get("embeddings")
             if embs is None or len(embs) == 0:
                 return
@@ -462,40 +633,22 @@ class VectorSearch:
         except Exception as e:
             logger.warning(f"Could not read collection dim for verification: {e}")
             return
-        ef = self.collection._embedding_function
         try:
-            probe = ef(["dim probe"])
-            ef_dim = len(probe[0])
+            ef_dim = len(self.embed_documents(["dim probe"])[0])   # outside the lock
         except Exception as e:
             logger.warning(f"Could not probe EF dim for verification: {e}")
             return
         if ef_dim != stored_dim:
-            ef_name = type(ef).__name__
+            ef_name = type(self.embedding_function).__name__
             logger.error(
                 f"EMBEDDING DIM MISMATCH: collection has {stored_dim}d vectors "
                 f"but the configured embedding function ({ef_name}) produces "
                 f"{ef_dim}d. Every query and most upserts will 400. "
                 f"Fix one of: (a) set CO_EMBEDDING_MODEL to match the model "
-                f"that built the collection ({stored_dim}d), (b) re-run "
-                f"enable-gemini-pipeline.sh to wipe + reindex at the new "
-                f"dim, or (c) wipe ~/.context-orchestrator/chroma and let "
-                f"the watcher rebuild from disk."
+                f"that built the collection ({stored_dim}d), (b) switch with "
+                f"`contorch-memory embeddings …` (one collection per model), or "
+                f"(c) `contorch-transcripts reindex` after wiping the index."
             )
-
-    def _connect(self) -> None:
-        if self.chroma_path is not None:
-            self.client = chromadb.PersistentClient(path=str(self.chroma_path))
-        else:
-            self.client = self._http_client_with_retry()
-        ef = _build_embedding_function()
-        self.identity = ef_identity(ef)
-        kwargs: dict = {
-            "name": self._collection_name(self.identity),
-            "metadata": {"hnsw:space": "cosine"},
-        }
-        if ef is not None:
-            kwargs["embedding_function"] = ef
-        self.collection = self.client.get_or_create_collection(**kwargs)
 
     def _collection_name(self, identity: str) -> str:
         """One collection per embedding model, so switching models never mixes
@@ -518,7 +671,9 @@ class VectorSearch:
         mapping[identity] = name
         try:
             map_file.parent.mkdir(parents=True, exist_ok=True)
-            map_file.write_text(json.dumps(mapping, indent=2, sort_keys=True))
+            tmp = map_file.with_name(f".{map_file.name}.{os.getpid()}.tmp")
+            tmp.write_text(json.dumps(mapping, indent=2, sort_keys=True))
+            os.replace(tmp, map_file)
         except OSError:
             pass
         return name
@@ -537,6 +692,7 @@ class VectorSearch:
         because the failure mode is a TCP refused, not a hang.
         """
         import time as _t
+        import chromadb
         last_err: Exception | None = None
         for delay in (0.5, 1.0, 2.0, 4.0, 8.0, 15.0):
             try:
@@ -557,13 +713,13 @@ class VectorSearch:
         ) from last_err
 
     def reload(self) -> None:
-        """Reconnect to disk so writes from other processes (e.g. the watcher) become visible."""
+        """Make other processes' writes visible. In-process mode needs nothing
+        (every session opens fresh); the BM25 cache is dropped either way."""
         if not self.enabled:
             return
-        self._connect()
-        # Underlying corpus may have changed — drop cached BM25 index.
-        self._bm25 = None
-        self._bm25_ids = []
+        if not self.in_process:
+            self._connect()
+        self.invalidate_bm25()
 
     def invalidate_bm25(self) -> None:
         """Force the next hybrid search to rebuild the BM25 index. Call this
@@ -571,9 +727,10 @@ class VectorSearch:
         self._bm25 = None
         self._bm25_ids = []
 
-    def _ensure_bm25(self) -> None:
+    def _ensure_bm25(self, col) -> None:
         """Build (or reuse) an in-memory BM25 index over every document in
         the collection. Lazy: only constructed on first hybrid search.
+        Called inside a session.
         """
         if self._bm25 is not None:
             return
@@ -583,7 +740,7 @@ class VectorSearch:
             raise RuntimeError(
                 "hybrid search requires rank-bm25 — pip install rank-bm25"
             ) from e
-        data = self.collection.get(include=["documents"], limit=100000)
+        data = col.get(include=["documents"], limit=100000)
         ids = data["ids"]
         docs = data["documents"]
         if not ids:
@@ -594,24 +751,47 @@ class VectorSearch:
         self._bm25_ids = ids
         self._bm25_tokens = [set(t) for t in tokenized]
 
+    # ---- writes ----------------------------------------------------------------
+
     def add(self, doc_id: str, text: str, metadata: dict) -> None:
         """Add or update a document in the vector index."""
-        if not self.enabled:
+        self.upsert([doc_id], [text], [metadata])
+
+    def upsert(self, ids: list[str], documents: list[str], metadatas: list[dict],
+               embeddings: Optional[list] = None) -> None:
+        """Upsert documents. Vectors are computed before the lock is taken
+        (or come from a bundle); the session only writes."""
+        if not self.enabled or not ids:
             return
-        self.collection.upsert(
-            ids=[doc_id],
-            documents=[text],
-            metadatas=[metadata],
-        )
+        if embeddings is None:
+            embeddings = self.embed_documents(documents)
+        with self.session(write=True) as col:
+            col.upsert(ids=ids, documents=documents, metadatas=metadatas, embeddings=embeddings)
+        self.invalidate_bm25()
 
     def remove(self, doc_id: str) -> None:
-        """Remove a document from the vector index."""
-        if not self.enabled:
+        """Remove a document from the vector index. Deleting an id that isn't
+        there is not an error in Chroma; anything that does fail is logged."""
+        self.remove_many([doc_id])
+
+    def remove_many(self, ids: list[str]) -> None:
+        if not self.enabled or not ids:
             return
         try:
-            self.collection.delete(ids=[doc_id])
+            with self.session(write=True) as col:
+                col.delete(ids=list(ids))
         except Exception:
-            pass  # Ignore if not found
+            logger.exception("could not remove %d id(s) from the vector index (first: %s)",
+                             len(ids), ids[0])
+        self.invalidate_bm25()
+
+    def all_ids(self) -> list[str]:
+        if not self.enabled:
+            return []
+        with self.session() as col:
+            return col.get(include=[])["ids"]
+
+    # ---- search ----------------------------------------------------------------
 
     def search(
         self,
@@ -649,24 +829,39 @@ class VectorSearch:
             rerank_model: override the LLM (default reads CO_RERANK_MODEL
                 env var, e.g. "gemini-flash-latest"). Soft-fails to base
                 ranking if the model can't be reached or no key is set.
+
+        In-process mode raises chroma_lock.LockTimeout when Chroma stays busy
+        longer than the lock timeout; callers fall back to full-text search.
         """
         if not self.enabled:
             return []
+        rr_model = (rerank_model or os.environ.get(RERANK_MODEL_ENV)) if rerank else None
         try:
-            return self._search(query, n_results, where, mmr, mmr_lambda, hybrid,
-                                rerank, rerank_model)
+            qvec = self.embed_query(query)               # outside the lock
         except Exception as exc:
             # The query couldn't be embedded (no key, invalid key, quota,
             # offline). Keyword matching over the same documents still answers
             # most proper-noun questions, so degrade instead of failing.
             logger.warning("dense search unavailable (%s) — falling back to keyword search",
                            str(exc)[:160])
-            return self._keyword_search(query, n_results, where)
+            with self.session() as col:
+                return self._keyword_search(col, query, n_results, where)
+        with self.session() as col:
+            try:
+                base = self._search(col, qvec, query, n_results, where, mmr, mmr_lambda,
+                                    hybrid, rr_model)
+            except Exception as exc:
+                logger.warning("dense search failed (%s) — falling back to keyword search",
+                               str(exc)[:160])
+                return self._keyword_search(col, query, n_results, where)
+        if rr_model:                                      # LLM call: outside the lock
+            return _llm_rerank(query, base, n_results, rr_model)
+        return base
 
-    def _keyword_search(self, query: str, n_results: int, where: Optional[dict]) -> list[dict]:
+    def _keyword_search(self, col, query: str, n_results: int, where: Optional[dict]) -> list[dict]:
         """BM25 over every document, filtered by `where` (equality, $gte, $lte,
-        $and — the operators search() builds)."""
-        self._ensure_bm25()
+        $and — the operators search() builds). Called inside a session."""
+        self._ensure_bm25(col)
         if self._bm25 is None:
             return []
         terms = _bm25_tokenize(query)
@@ -679,7 +874,7 @@ class VectorSearch:
         out: list[dict] = []
         for start in range(0, len(order), 200):
             ids = [self._bm25_ids[i] for i in order[start:start + 200]]
-            got = self.collection.get(ids=ids, include=["documents", "metadatas"])
+            got = col.get(ids=ids, include=["documents", "metadatas"])
             by_id = {id_: (got["documents"][k], got["metadatas"][k]) for k, id_ in enumerate(got["ids"])}
             for id_ in ids:
                 if id_ not in by_id:
@@ -692,38 +887,31 @@ class VectorSearch:
                     return out
         return out
 
-    def _search(self, query, n_results, where, mmr, mmr_lambda, hybrid, rerank, rerank_model):
-        total = self.collection.count() or 1
-
-        # Resolve the rerank model up front so misconfig fails loudly only
-        # when actually requested.
-        rr_model = None
-        if rerank:
-            rr_model = rerank_model or os.environ.get(RERANK_MODEL_ENV)
+    def _search(self, col, qvec, query, n_results, where, mmr, mmr_lambda, hybrid, rr_model):
+        """Dense (+ BM25) retrieval inside a session. Returns the base ranking;
+        an LLM rerank, if any, happens after the session."""
+        total = col.count() or 1
 
         if hybrid:
-            base = self._hybrid_search(
-                query,
+            return self._hybrid_search(
+                col, qvec, query,
                 n_results=(RERANK_FETCH if rr_model else n_results),
                 mmr=mmr,
                 mmr_lambda=mmr_lambda,
             )
-            if rr_model:
-                return _llm_rerank(query, base, n_results, rr_model)
-            return base
 
         if mmr:
             # If reranking, fetch enough for the rerank stage
             mmr_target = RERANK_FETCH if rr_model else n_results
             fetch_n = min(total, max(MMR_CANDIDATE_MIN, mmr_target * MMR_CANDIDATE_MULTIPLIER))
             kwargs = {
-                "query_texts": [query],
+                "query_embeddings": [qvec],
                 "n_results": fetch_n,
                 "include": ["documents", "metadatas", "embeddings", "distances"],
             }
             if where:
                 kwargs["where"] = where
-            results = self.collection.query(**kwargs)
+            results = col.query(**kwargs)
             if not results or not results["ids"] or not results["ids"][0]:
                 return []
             candidates = []
@@ -741,24 +929,21 @@ class VectorSearch:
                 })
             reranked = _mmr_select(candidates, mmr_target, lam=mmr_lambda)
             # Strip the embedding before returning — callers don't need it.
-            stripped = [
+            return [
                 {k: v for k, v in c.items() if k not in ("embedding", "sim_to_query")}
                 for c in reranked
             ]
-            if rr_model:
-                return _llm_rerank(query, stripped, n_results, rr_model)
-            return stripped
 
         # Standard path: raw cosine top-K
         fetch_for_base = RERANK_FETCH if rr_model else n_results
         kwargs = {
-            "query_texts": [query],
+            "query_embeddings": [qvec],
             "n_results": min(fetch_for_base, total),
         }
         if where:
             kwargs["where"] = where
 
-        results = self.collection.query(**kwargs)
+        results = col.query(**kwargs)
 
         hits = []
         if results and results["ids"] and results["ids"][0]:
@@ -769,26 +954,26 @@ class VectorSearch:
                     "metadata": results["metadatas"][0][i] if results["metadatas"] else {},
                     "distance": results["distances"][0][i] if results["distances"] else None,
                 })
-        if rr_model:
-            return _llm_rerank(query, hits, n_results, rr_model)
         return hits
 
     def _hybrid_search(
         self,
+        col,
+        qvec,
         query: str,
         n_results: int,
         mmr: bool,
         mmr_lambda: float,
     ) -> list[dict]:
         """Dense + BM25 → RRF fuse → optional MMR → top-K."""
-        total = self.collection.count() or 1
+        total = col.count() or 1
         fetch = min(total, HYBRID_FETCH_PER_RETRIEVER)
 
         # Dense retrieval — also gives us embeddings for an optional MMR step
         include = ["documents", "metadatas", "distances"]
         if mmr:
             include.append("embeddings")
-        dense = self.collection.query(query_texts=[query], n_results=fetch, include=include)
+        dense = col.query(query_embeddings=[qvec], n_results=fetch, include=include)
         if not dense or not dense["ids"] or not dense["ids"][0]:
             return []
         dense_ids = dense["ids"][0]
@@ -800,7 +985,7 @@ class VectorSearch:
         )
 
         # BM25 retrieval over the cached corpus
-        self._ensure_bm25()
+        self._ensure_bm25(col)
         if self._bm25 is None:
             # Empty collection — degrade to dense only
             return [
@@ -821,7 +1006,7 @@ class VectorSearch:
         missing = [id_ for id_, _ in fused if id_ not in doc_by_id]
         if missing:
             extra_include = ["documents", "metadatas"] + (["embeddings"] if mmr else [])
-            extra = self.collection.get(ids=missing, include=extra_include)
+            extra = col.get(ids=missing, include=extra_include)
             for i, id_ in enumerate(extra["ids"]):
                 doc_by_id[id_] = extra["documents"][i]
                 meta_by_id[id_] = extra["metadatas"][i]
@@ -866,4 +1051,7 @@ class VectorSearch:
         return out
 
     def count(self) -> int:
-        return self.collection.count() if self.enabled else 0
+        if not self.enabled:
+            return 0
+        with self.session() as col:
+            return col.count()

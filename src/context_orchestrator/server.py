@@ -9,6 +9,7 @@ from pathlib import Path
 import anyio
 from mcp.server.fastmcp import FastMCP
 from context_orchestrator.db import Database
+from context_orchestrator.chroma_lock import LockTimeout
 from context_orchestrator.search import VectorSearch
 from context_orchestrator.ingest import index_file_content
 from context_orchestrator.watcher import catch_up as _catch_up_transcripts
@@ -60,7 +61,7 @@ def _sync_index():
     if not vs.enabled:
         logger.info("Embeddings off — nothing to sync to a vector index (full-text search only)")
         return
-    existing_ids = set(vs.collection.get(include=[])["ids"])
+    existing_ids = set(vs.all_ids())
     rk_ids = {f"repo_knowledge:{r[0]}" for r in db.conn.execute(
         "SELECT id FROM repo_knowledge").fetchall()}
     # Only text sources get indexed as `source:<id>`; repo/url types are
@@ -405,11 +406,9 @@ def remove_source(task_name: str, source_id: int, project: str = "") -> str:
         return f"Error: Source {source_id} does not belong to task '{task_name}'."
 
     if db.remove_source(source_id):
-        vs.remove(f"source:{source_id}")
-        vs.remove(f"source_notes:{source_id}")
-        # Clean up file chunks (try up to 100 chunks)
-        for i in range(100):
-            vs.remove(f"file_chunk:{source_id}:{i}")
+        # One session for all of them (file chunks: try up to 100).
+        vs.remove_many([f"source:{source_id}", f"source_notes:{source_id}"]
+                       + [f"file_chunk:{source_id}:{i}" for i in range(100)])
         return f"Removed source {source_id} from task '{task_name}'."
     return f"Error: Source {source_id} not found."
 
@@ -618,16 +617,24 @@ def search(
     # When filters are in play, hybrid is incompatible (BM25 is unfiltered).
     # Otherwise default to hybrid + MMR for best general-purpose ranking.
     use_hybrid = where is None
-    dense = vs.search(
-        query,
-        n_results=10,
-        where=where,
-        hybrid=use_hybrid,
-        mmr=True,
-        mmr_lambda=0.7,
-        rerank=rerank,
-    )
-    if not dense and project and where:
+    try:
+        dense = vs.search(
+            query,
+            n_results=10,
+            where=where,
+            hybrid=use_hybrid,
+            mmr=True,
+            mmr_lambda=0.7,
+            rerank=rerank,
+        )
+    except LockTimeout as exc:
+        # Another process kept the in-process index busy; full-text search
+        # below still answers.
+        logger.warning("vector search skipped: %s", exc)
+        dense, project_fallback_ok = [], False
+    else:
+        project_fallback_ok = True
+    if not dense and project and where and project_fallback_ok:
         # Fallback: drop the project filter (repo knowledge isn't project-scoped)
         other_filters = [f for f in filters if "project" not in f]
         fallback_where = (
@@ -635,15 +642,19 @@ def search(
             else other_filters[0] if len(other_filters) == 1
             else {"$and": other_filters}
         )
-        dense = vs.search(
-            query,
-            n_results=10,
-            where=fallback_where,
-            hybrid=fallback_where is None,
-            mmr=True,
-            mmr_lambda=0.7,
-            rerank=rerank,
-        )
+        try:
+            dense = vs.search(
+                query,
+                n_results=10,
+                where=fallback_where,
+                hybrid=fallback_where is None,
+                mmr=True,
+                mmr_lambda=0.7,
+                rerank=rerank,
+            )
+        except LockTimeout as exc:
+            logger.warning("vector search skipped: %s", exc)
+            dense = []
 
     # Full-text search (SQLite FTS5) runs alongside: it needs no embedding
     # model, finds a transcript the moment it's stored, and nails exact

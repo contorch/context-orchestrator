@@ -162,19 +162,21 @@ def chunks_for(row: dict) -> list[tuple[str, str, dict]]:
 
 def _replace_chunks(vs, meeting_id: str, ids: list[str], docs: list[str], metas: list[dict],
                     embeddings: Optional[list] = None) -> None:
-    """Upsert the new chunks first, then drop leftovers. If the upsert fails
-    (embedding error) the meeting's previous chunks stay searchable."""
+    """Upsert the new chunks first, then drop leftovers. If embedding fails
+    (no key, quota) nothing is written and the meeting's previous chunks stay
+    searchable. Vectors are computed before the Chroma session lock is taken;
+    the session only writes."""
     if not vs.enabled:
         return
-    if ids:
-        kwargs = {"ids": ids, "documents": docs, "metadatas": metas}
-        if embeddings is not None:
-            kwargs["embeddings"] = embeddings
-        vs.collection.upsert(**kwargs)
-    existing = vs.collection.get(where={"meeting_id": meeting_id}, include=[])["ids"]
-    stale = sorted(set(existing) - set(ids))
-    if stale:
-        vs.collection.delete(ids=stale)
+    if ids and embeddings is None:
+        embeddings = vs.embed_documents(docs)
+    with vs.session(write=True) as col:
+        if ids:
+            col.upsert(ids=ids, documents=docs, metadatas=metas, embeddings=embeddings)
+        existing = col.get(where={"meeting_id": meeting_id}, include=[])["ids"]
+        stale = sorted(set(existing) - set(ids))
+        if stale:
+            col.delete(ids=stale)
     vs.invalidate_bm25()
 
 
@@ -217,10 +219,11 @@ def index_pending(vs, db, settle_seconds: float = SETTLE_SECONDS,
 def remove_from_index(vs, meeting_id: str) -> None:
     if not vs.enabled:
         return
-    ids = vs.collection.get(where={"meeting_id": meeting_id}, include=[])["ids"]
-    if ids:
-        vs.collection.delete(ids=ids)
-        vs.invalidate_bm25()
+    with vs.session(write=True) as col:
+        ids = col.get(where={"meeting_id": meeting_id}, include=[])["ids"]
+        if ids:
+            col.delete(ids=ids)
+    vs.invalidate_bm25()
 
 
 # ---- adding transcripts -----------------------------------------------------
@@ -368,9 +371,12 @@ def is_bundle(path: Path) -> bool:
 
 
 def _collection_dim(vs) -> Optional[int]:
-    if not vs.enabled or vs.collection.count() == 0:
+    if not vs.enabled:
         return None
-    got = vs.collection.get(limit=1, include=["embeddings"]).get("embeddings")
+    with vs.session() as col:
+        if col.count() == 0:
+            return None
+        got = col.get(limit=1, include=["embeddings"]).get("embeddings")
     return len(got[0]) if got is not None and len(got) else None
 
 
@@ -381,7 +387,7 @@ def import_bundle(vs, db, path: Path) -> dict:
     stats = {"stored": 0, "unchanged": 0, "vectors_loaded": 0, "pending": 0}
     with path.open(encoding="utf-8") as f:
         header = json.loads(f.readline())
-        local_ef = _ef_identity(vs.collection._embedding_function) if vs.enabled else "none"
+        local_ef = _ef_identity(vs.embedding_function) if vs.enabled else "none"
         local_dim = _collection_dim(vs)
         text_only = header.get("embedding_function") is None
         compatible = not text_only and header.get("embedding_function") == local_ef and (

@@ -12,7 +12,7 @@ name: install-smoke
 
 on:
   pull_request:
-    paths: ["bootstrap.sh", "setup.sh", "install-claude-context.sh", "enable-gemini-pipeline.sh", "src/**", "pyproject.toml", ".github/workflows/install-smoke.yml"]
+    paths: ["bootstrap.sh", "setup.sh", "install-claude-context.sh", "enable-gemini-pipeline.sh", "src/**", "tests/**", "hooks/**", "pyproject.toml", ".github/workflows/install-smoke.yml"]
   push:
     branches: [main]
   workflow_dispatch:
@@ -28,7 +28,30 @@ jobs:
       - name: pytest
         run: |
           python -m pip install -q -e '.[dev]'
+          # The session lock is proven on exactly this chromadb (pyproject pin).
+          test "$(python -c 'from importlib.metadata import version; print(version("chromadb"))')" = 1.5.9
           python -m pytest -q tests
+
+  slow:
+    # Multi-process in-process-Chroma stress (writers + long-lived MCP servers
+    # + hooks on one folder). Must print vectorless=0 resurrected=0. Any
+    # chromadb bump has to pass this.
+    runs-on: macos-15
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
+      - name: pytest -m slow
+        env:
+          CO_STRESS_REPORT: ${{ runner.temp }}/stress-report.jsonl
+        run: |
+          python -m pip install -q -e '.[dev]'
+          python -m pytest -q -s -m slow tests/test_chroma_concurrency.py
+      - name: Upload stress report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with: { name: chroma-stress-report, path: "${{ runner.temp }}/stress-report.jsonl", if-no-files-found: ignore }
 
   lint:
     runs-on: macos-15

@@ -7,7 +7,12 @@ dependencies = [
     # mcp 2.x renamed FastMCP → MCPServer and changed APIs; a fresh install
     # resolved 2.x and the server died on import. Pin until server.py is ported.
     "mcp[cli]>=1.0.0,<2",
-    "chromadb>=0.5.0",
+    # Pinned: in-process Chroma is only safe under the session lock
+    # (chroma_lock.py), proven on exactly this version, and the lock relies on
+    # a chromadb internal (SharedSystemClient.clear_system_cache).
+    # Bumps must pass the slow stress test:
+    #   pytest -q -m slow tests/test_chroma_concurrency.py
+    "chromadb==1.5.9",
     "rank-bm25>=0.2.2",
 ]
 
@@ -50,3 +55,9 @@ build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/context_orchestrator"]
+
+[tool.pytest.ini_options]
+markers = [
+    "slow: multi-process stress tests (minutes); run with -m slow",
+]
+addopts = "-m 'not slow'"
