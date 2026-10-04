@@ -446,6 +446,32 @@ def _clear_chroma_system_cache() -> None:
     SharedSystemClient.clear_system_cache()
 
 
+_DEFAULT_EF = None
+
+
+def _shared_default_ef():
+    """One MiniLM (ONNX) session per process, however many VectorSearch
+    objects exist: the model is ~80 MB and each session owns a thread pool."""
+    global _DEFAULT_EF
+    if _DEFAULT_EF is None:
+        import atexit
+        from chromadb.utils.embedding_functions import DefaultEmbeddingFunction
+        _DEFAULT_EF = DefaultEmbeddingFunction()
+        atexit.register(_release_default_ef)
+    return _DEFAULT_EF
+
+
+def _release_default_ef() -> None:
+    """Drop the ONNX session before interpreter teardown, so its worker
+    threads are joined while the runtime is intact. Left to static
+    destructors, a worker sometimes locks a destroyed mutex and the process
+    aborts at exit (libc++abi "recursive_mutex lock failed", exit 134)."""
+    global _DEFAULT_EF
+    _DEFAULT_EF = None
+    import gc
+    gc.collect()
+
+
 class VectorSearch:
     """The vector index (Chroma). Two modes:
 
@@ -491,7 +517,6 @@ class VectorSearch:
         self._col = None            # the open collection (HTTP: always; in-process: inside a session)
         self._client = None
         self._name: Optional[str] = None
-        self._default_ef = None
         self._session_wrote = False
         # CO_EMBEDDING_MODEL=none: no vector index at all. Every method is a
         # no-op / empty; search runs on SQLite full-text search instead.
@@ -592,10 +617,7 @@ class VectorSearch:
         built-in MiniLM when no model is configured)."""
         if self._ef is not None:
             return self._ef
-        if self._default_ef is None:
-            from chromadb.utils.embedding_functions import DefaultEmbeddingFunction
-            self._default_ef = DefaultEmbeddingFunction()
-        return self._default_ef
+        return _shared_default_ef()
 
     def embed_documents(self, texts: list[str]) -> list:
         """Document vectors, exactly as Chroma would compute them at upsert."""
