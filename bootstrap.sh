@@ -345,8 +345,8 @@ ${BOLD}Installed at:${RESET}
 ${BOLD}${YELLOW}Then:${RESET}
 
   ${CYAN}▶${RESET} ${BOLD}Restart Claude Code${RESET}
-       Quit and relaunch the app so it picks up the new MCP server +
-       UserPromptSubmit hook from ~/.claude/settings.json.
+       Quit and relaunch the app so it picks up the new MCP server and
+       the auto-context hook.
 
 ${BOLD}Verify everything works:${RESET}
   Click the ○ icon in your menu bar → ${BOLD}"Run end-to-end smoke test"${RESET}.
@@ -355,7 +355,7 @@ ${BOLD}Verify everything works:${RESET}
 ${BOLD}Useful one-liners:${RESET}
   launchctl list | grep com.contorch            ${DIM}# all daemons${RESET}
   curl http://127.0.0.1:8765/api/v2/heartbeat   ${DIM}# chroma daemon${RESET}
-  ~/.claude/hooks/auto-context.py < /dev/null   ${DIM}# probe the hook${RESET}
+  $CONTEXT_ORCH_DIR/.venv/bin/contorch-memory claude status   ${DIM}# Claude Code connection${RESET}
 
 EOF
 }

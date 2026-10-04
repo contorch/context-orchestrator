@@ -14,7 +14,7 @@ Pairs with [meeting-capture](https://github.com/contorch/meeting-capture) — th
 
 - macOS or Linux
 - Python 3.10+
-- Claude Code (the MCP server is registered via `claude mcp add`)
+- Claude Code (connected by `contorch-memory claude install`, see below)
 
 ## Install
 
@@ -36,7 +36,7 @@ cd context-orchestrator
 ./setup.sh
 ```
 
-`setup.sh` checks prerequisites, creates a Python venv, registers the MCP server with Claude Code (via `claude mcp add`), appends standard usage instructions to `~/.claude/CLAUDE.md`, installs the chroma HTTP server launchd agent (with a one-time backup of any existing chroma data), and installs the `transcript-watcher` launchd auto-start agent.
+`setup.sh` checks prerequisites, creates a Python venv, installs the chroma HTTP server launchd agent (with a one-time backup of any existing chroma data), and connects Claude Code with `contorch-memory claude install --no-hook`; `install-claude-context.sh` runs the same command with the auto-context hook.
 
 ### Lightweight — database + index only, no daemons
 
@@ -47,10 +47,7 @@ python3 -m venv ~/.contorch-lite                     # Python 3.10+
 ~/.contorch-lite/bin/pip install "context-orchestrator[embeddings-gemini] @ git+https://github.com/contorch/context-orchestrator"
 mkdir -p ~/.context-orchestrator
 echo "CO_EMBEDDING_MODEL=gemini-embedding-001" >> ~/.context-orchestrator/env   # must match the machine that embeds
-claude mcp add -s user context-orchestrator -- ~/.contorch-lite/bin/contorch-mcp
-mkdir -p ~/.claude/skills/transcripts && curl -fsSL \
-  https://raw.githubusercontent.com/contorch/context-orchestrator/main/skills/transcripts/SKILL.md \
-  -o ~/.claude/skills/transcripts/SKILL.md
+~/.contorch-lite/bin/contorch-memory claude install   # MCP server, hook, CLAUDE.md block, transcripts skill
 ```
 
 With no chroma launchd agent installed, the index is opened from `~/.context-orchestrator/chroma/` directly. Several processes share it (one MCP server per Claude Code session, the CLIs, the auto-context hook), and chromadb is not process-safe on a shared folder, so every operation runs inside one cross-process lock (`~/.context-orchestrator/chroma.lock`): open fresh, operate, close. Embeddings are computed before the lock is taken; the hook waits at most 2 s for it and otherwise answers from full-text search. chromadb is pinned (1.5.9) because the lock was proven on that version — see `tests/test_chroma_concurrency.py` (`pytest -m slow`). A Gemini key is optional here: without one, vectors come from embedding bundles made on another machine (`contorch-transcripts embed … -o bundle.jsonl` there, `contorch-transcripts import bundle.jsonl` here) and `search` falls back to keyword matching for the query. With a key (`~/.config/google/key`), transcripts are embedded locally and search is semantic.
@@ -85,6 +82,17 @@ To verify:
 ### MCP server
 
 Long-lived process spawned by Claude Code on session start. Exposes the tools above. Uses a local SQLite database at `~/.context-orchestrator/context.db` for tasks, sources and transcripts, and ChromaDB for the vector index — via the chroma HTTP server when its launchd agent is installed, otherwise in-process from `~/.context-orchestrator/chroma/` (`CO_CHROMA_PATH` overrides).
+
+### Claude Code integration
+
+`contorch-memory claude install|uninstall|status [--channel app|brew|dev] [--no-hook] [--backup-dir D] [--json]` is the only thing that touches Claude Code:
+
+- the MCP server `context-orchestrator` (user scope, `claude mcp add`), pointing at this install's own `contorch-mcp`; only known `CO_*` env keys are kept, and `CO_CHROMA_HOST/PORT` are dropped when the index is in-process;
+- one `UserPromptSubmit` hook entry, guarded and tagged — `[ -x '<path>/contorch-hook' ] && '<path>/contorch-hook'; exit 0 # contorch-hook:<channel>` with a 10 s timeout — so a removed install is silent instead of erroring on every prompt;
+- one marked block in `CLAUDE.md` (`<!-- contorch -->` … `<!-- /contorch -->`);
+- the `transcripts` skill, written with this install's absolute `contorch-transcripts` path and a `.contorch-skill.json` stamp.
+
+Older installs are migrated: a copied `~/.claude/hooks/auto-context.py`, the old `CONTEXT-ORCHESTRATOR` / `auto-context-section` CLAUDE.md blocks and a curl'ed skill are replaced only when they are byte-identical to a version we shipped; edited copies are kept and reported as a to-do. `uninstall` removes only what carries Contorch's tag, marker or stamp. Claude Code's files follow `CLAUDE_CONFIG_DIR`; managed settings that block hooks or MCP servers are detected and reported (`blocked_by_managed_settings`). Running the same install twice changes nothing.
 
 ### chroma server
 
@@ -122,7 +130,7 @@ Every transcript is a row in the `transcripts` table (full text in `body`); Chro
 
 A bundle records the embedding function and vector size; `import` loads the vectors only when they match this index, otherwise it stores the text and embeds it locally.
 
-The `skills/transcripts` Claude Code skill wraps all of this: give Claude a URL, a pasted transcript, a zip or a bundle and it stores it verbatim.
+The `transcripts` Claude Code skill (installed by `contorch-memory claude install`) wraps all of this: give Claude a URL, a pasted transcript, a zip or a bundle and it stores it verbatim.
 
 Moving from the old `~/transcripts/*.md` files: `contorch-transcripts import ~/transcripts --delete`.
 

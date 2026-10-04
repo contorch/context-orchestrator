@@ -4,11 +4,6 @@ set -e
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 # bootstrap.sh exports PYTHON when Apple's python3 (3.9) is too old; honor it.
 PYTHON="${PYTHON:-python3}"
-CLAUDE_MD="$HOME/.claude/CLAUDE.md"
-TEMPLATE="$SCRIPT_DIR/claude-md-template.md"
-MARKER="CONTEXT-ORCHESTRATOR"
-PYTHON_PATH="$SCRIPT_DIR/.venv/bin/python"
-SRC_PATH="$SCRIPT_DIR/src"
 
 INSTALL_LAUNCHD=1
 for arg in "$@"; do
@@ -60,7 +55,7 @@ fi
 if command -v claude &>/dev/null; then
     ok "claude CLI on PATH"
 else
-    echo "  ⚠ claude CLI not on PATH. MCP registration will print manual instructions instead."
+    echo "  ⚠ claude CLI not on PATH. The MCP registration is left as a to-do."
 fi
 
 if [ "$PREREQS_OK" -eq 0 ]; then
@@ -83,46 +78,7 @@ echo "Installing dependencies..."
 "$SCRIPT_DIR/.venv/bin/pip" install -q -e "$SCRIPT_DIR"
 
 # ---------------------------------------------------------------------------
-# 2. Update ~/.claude/CLAUDE.md (append, idempotent)
-# ---------------------------------------------------------------------------
-mkdir -p "$HOME/.claude"
-
-if [ -f "$CLAUDE_MD" ] && grep -q "$MARKER" "$CLAUDE_MD"; then
-    echo "CLAUDE.md already has context-orchestrator instructions — skipping."
-else
-    echo "Appending context-orchestrator instructions to $CLAUDE_MD..."
-    cat "$TEMPLATE" >> "$CLAUDE_MD"
-fi
-
-# ---------------------------------------------------------------------------
-# 3. Register MCP server with Claude Code
-# ---------------------------------------------------------------------------
-if command -v claude &>/dev/null; then
-    # Remove existing entry if present (idempotent)
-    claude mcp remove --scope user context-orchestrator 2>/dev/null || true
-
-    echo "Registering MCP server with Claude Code..."
-    claude mcp add -t stdio -s user \
-        -e "PYTHONPATH=$SRC_PATH" \
-        -- context-orchestrator "$PYTHON_PATH" -m context_orchestrator.server
-else
-    cat <<EOF
-
-Claude Code CLI not found. Add manually to ~/.claude.json under "mcpServers":
-
-  "context-orchestrator": {
-    "type": "stdio",
-    "command": "$PYTHON_PATH",
-    "args": ["-m", "context_orchestrator.server"],
-    "env": {
-      "PYTHONPATH": "$SRC_PATH"
-    }
-  }
-EOF
-fi
-
-# ---------------------------------------------------------------------------
-# 4. Cut over to chroma HTTP server (single source of truth, no SQLite contention)
+# 2. Cut over to chroma HTTP server (single source of truth, no SQLite contention)
 # ---------------------------------------------------------------------------
 CHROMA_DIR="$HOME/.context-orchestrator/chroma"
 if [ "$INSTALL_LAUNCHD" -eq 1 ]; then
@@ -172,13 +128,23 @@ if [ "$INSTALL_LAUNCHD" -eq 1 ]; then
 else
     echo ""
     echo "Skipping launchd install (--no-launchd flag)."
-    echo "  Note: search.py defaults to HttpClient — without the chroma daemon"
-    echo "  running, queries will fail. Start it manually:"
-    echo "    $SCRIPT_DIR/.venv/bin/chroma run --path $CHROMA_DIR --host 127.0.0.1 --port 8765"
+    echo "  Without the chroma server the index is opened in-process from"
+    echo "  $CHROMA_DIR (lightweight mode, one cross-process lock)."
 fi
 
 # ---------------------------------------------------------------------------
-# 5. Done
+# 3. Claude Code: MCP server, CLAUDE.md block, transcripts skill. One owner —
+#    `contorch-memory claude install`; the auto-context hook is added by
+#    install-claude-context.sh. After the chroma step, so the registration
+#    knows whether the index is in-process.
+# ---------------------------------------------------------------------------
+echo ""
+echo "Connecting Claude Code..."
+"$SCRIPT_DIR/.venv/bin/contorch-memory" claude install --channel "${CONTORCH_CHANNEL:-dev}" --no-hook \
+    || echo "  ⚠ Claude Code connection incomplete — re-run: $SCRIPT_DIR/.venv/bin/contorch-memory claude install"
+
+# ---------------------------------------------------------------------------
+# 4. Done
 # ---------------------------------------------------------------------------
 cat <<EOF
 

@@ -66,6 +66,8 @@ jobs:
           ! grep -nE 'mapfile|readarray|declare -A|\$\{[a-zA-Z_]+(,,|\^\^)|&>>|\[\[ -v|read -i|coproc' bootstrap.sh setup.sh install-claude-context.sh enable-gemini-pipeline.sh
           # "$name…" — bash 3.2 in a UTF-8 locale reads the ellipsis as part of the name
           ! grep -nP '\$[A-Za-z_][A-Za-z0-9_]*[^\x00-\x7F]' bootstrap.sh setup.sh install-claude-context.sh enable-gemini-pipeline.sh
+      - name: "no shell script edits Claude Code directly (one owner: contorch-memory claude)"
+        run: /bin/bash tests/test_no_claude_edit_in_bash.sh
       - name: entry guard survives bash -c and a pipe under set -u
         run: |
           set -euo pipefail
@@ -114,12 +116,29 @@ jobs:
           # Daemon-free indexing: the watcher agent must NOT be installed.
           test ! -f "$HOME/Library/LaunchAgents/com.contorch.transcript-watcher.plist"
           test -f "$HOME/Library/LaunchAgents/com.contorch.meeting-capture.plist"
-          test -x "$HOME/.claude/hooks/auto-context.py"
-          python3 -c "import json; h=json.load(open('$HOME/.claude/settings.json'))['hooks']['UserPromptSubmit']; assert h, 'hook not wired'"
+          # Claude Code integration (contorch-memory claude install): the guarded,
+          # tagged hook entry, the CLAUDE.md block, the rendered skill. The
+          # runner has no `claude` CLI, so the MCP entry is a to-do there.
+          M="$B/context-orchestrator/.venv/bin/contorch-memory"
+          "$M" claude status --json | tee /tmp/claude-status.json | jq -e '.hook.matches and .claude_md.matches and .skill.matches'
+          jq -e '.hooks.UserPromptSubmit | map(.hooks[]) | map(select(.command | test("# contorch-hook:dev$"))) | length == 1 and (.[0].timeout == 10) and (.[0].command | startswith("[ -x "))' "$HOME/.claude/settings.json"
+          HOOK_CMD=$(jq -r '.hooks.UserPromptSubmit | map(.hooks[]) | map(select(.command | test("contorch-hook"))) | .[0].command' "$HOME/.claude/settings.json")
+          echo '{"prompt":"when does the zebra migration ship?","cwd":"/tmp"}' | /bin/sh -c "$HOOK_CMD" | jq -e 'has("additionalContext")'
+          test ! -e "$HOME/.claude/hooks/auto-context.py"
+          grep -q "<!-- contorch -->" "$HOME/.claude/CLAUDE.md"
+          grep -q "^CT=.*contorch-transcripts" "$HOME/.claude/skills/transcripts/SKILL.md"
           curl -fsS http://127.0.0.1:8765/api/v2/heartbeat
           "$B/context-orchestrator/.venv/bin/transcript-watcher" doctor
           "$B/meeting-capture/.venv/bin/meeting-capture" doctor || true   # TCC grants can't exist on a runner
           grep -q "Not done yet" /tmp/bootstrap.log && grep -A6 "Not done yet" /tmp/bootstrap.log
+      - name: claude install in a scratch CLAUDE_CONFIG_DIR is guarded and idempotent
+        run: |
+          set -euo pipefail
+          M=/Users/runner/contorch-ci/context-orchestrator/.venv/bin/contorch-memory
+          export CLAUDE_CONFIG_DIR="$RUNNER_TEMP/claude cfg"
+          "$M" claude install --channel dev --json | jq -e '.ok and .hook.matches'
+          jq -e '.hooks.UserPromptSubmit[0].hooks[0].command | test("^\\[ -x .+ \\] && .+; exit 0 # contorch-hook:dev$")' "$CLAUDE_CONFIG_DIR/settings.json"
+          "$M" claude install --channel dev --json | jq -e '.changed == [] and .hook.matches and .claude_md.matches and .skill.matches'
       - name: The MCP server Claude Code will launch actually answers
         run: |
           set -euo pipefail

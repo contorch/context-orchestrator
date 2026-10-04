@@ -3,6 +3,7 @@
     contorch-memory status
     contorch-memory embeddings                  # show the current choice
     contorch-memory embeddings gemini|local|none
+    contorch-memory claude install|uninstall|status [--channel app|brew|dev] [--json]
 
 The embedding choice decides how search understands a question:
   gemini — Google's gemini-embedding-001: best at paraphrases; needs a key
@@ -86,13 +87,49 @@ def set_embeddings(name: str, env_file: Path = ENV_FILE) -> str:
     return "\n".join(msg)
 
 
+def _cmd_claude(args) -> int:
+    from . import claude_install as ci
+    from .jsonout import emit, error, reserved_stdout
+    backup = Path(args.backup_dir).expanduser() if args.backup_dir else None
+
+    def run():
+        if args.action == "install":
+            return ci.install(args.channel, hook=not args.no_hook, backup_dir=backup)
+        if args.action == "uninstall":
+            return ci.uninstall(args.channel, backup_dir=backup)
+        return ci.status(args.channel)
+    if args.json:
+        with reserved_stdout() as out:
+            try:
+                doc = run()
+            except Exception as exc:   # one document, whatever happens
+                doc = {"schema": ci.SCHEMA, "ok": False, "action": args.action,
+                       "error": error("internal", f"{type(exc).__name__}: {exc}")}
+            print(ci.describe(doc) if "mcp" in doc else doc["error"]["message"], file=sys.stderr)
+            emit(doc, out)
+    else:
+        doc = run()
+        print(ci.describe(doc))
+    return 0 if (doc.get("ok") or args.action == "status") else 1
+
+
 def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(prog="contorch-memory", description=__doc__.split("\n\n")[0])
     sub = p.add_subparsers(dest="cmd", required=True)
     e = sub.add_parser("embeddings", help="show or set the embedding model: gemini, local, none")
     e.add_argument("choice", nargs="?", choices=list(CHOICES))
     sub.add_parser("status", help="embedding choice, transcripts stored, pending, index size")
+    c = sub.add_parser("claude", help="connect Claude Code: MCP server, hook, CLAUDE.md block, transcripts skill")
+    c.add_argument("action", choices=("install", "uninstall", "status"))
+    c.add_argument("--channel", choices=("app", "brew", "dev"), default=None,
+                   help="which install this is (default: $CONTORCH_CHANNEL, else dev)")
+    c.add_argument("--no-hook", action="store_true", help="install: leave the auto-context hook out")
+    c.add_argument("--backup-dir", help="copy settings.json / CLAUDE.md here before changing them")
+    c.add_argument("--json", action="store_true", help="one JSON document on stdout")
     args = p.parse_args(argv)
+
+    if args.cmd == "claude":
+        return _cmd_claude(args)
 
     if args.cmd == "embeddings":
         if args.choice is None:

@@ -17,7 +17,8 @@ import subprocess
 import sys
 from pathlib import Path
 
-import chromadb
+# chromadb is imported where it is used: `contorch-memory status` and the
+# claude installer read LAUNCHD_PLIST without loading Chroma.
 
 CHROMA_PATH = Path.home() / ".context-orchestrator" / "chroma"
 LOG_DIR = Path.home() / ".context-orchestrator"
@@ -79,6 +80,7 @@ def is_listening(host: str = DEFAULT_HOST, port: int = DEFAULT_PORT, timeout: fl
 def heartbeat(host: str = DEFAULT_HOST, port: int = DEFAULT_PORT) -> tuple[bool, str]:
     """Round-trip a count() against the chroma server. Returns (ok, message)."""
     try:
+        import chromadb
         client = chromadb.HttpClient(host=host, port=port)
         col = client.get_or_create_collection("context")
         return True, f"{col.count()} documents"
