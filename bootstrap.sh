@@ -231,6 +231,17 @@ EOF
 setup_context_orch() {
     step "[1/5] context-orchestrator"
     clone_or_update "$CONTEXT_ORCH_REPO" "$CONTEXT_ORCH_DIR" "context-orchestrator"
+    # Channel guard: if another install (Contorch.app, Homebrew) owns this Mac,
+    # stop here — before any venv, Claude Code or launchd change.
+    if [ -f "$CONTEXT_ORCH_DIR/scripts/contorch_channel_guard.sh" ]; then
+        . "$CONTEXT_ORCH_DIR/scripts/contorch_channel_guard.sh"
+        local guard=0
+        contorch_channel_guard || guard=$?
+        if [ "$guard" -ne 0 ]; then
+            printf "  ${RED}✗${RESET} %s\n" "nothing was changed (channel guard)" >&2
+            exit "$guard"
+        fi
+    fi
     info "running setup.sh…"
     if (cd "$CONTEXT_ORCH_DIR" && bash setup.sh 2>&1 | sed 's/^/    /'); then
         ok "context-orchestrator setup complete"
@@ -257,20 +268,46 @@ setup_meeting_capture() {
 
 setup_gemini() {
     step "[3/5] Gemini activation (optional)"
-    if prompt_gemini_key; then
-        info "running enable-gemini-pipeline.sh…"
-        export CONTEXT_ORCH="$CONTEXT_ORCH_DIR"
-        export MEETING_CAPTURE="$MEETING_CAPTURE_DIR"
-        if (cd "$CONTEXT_ORCH_DIR" && bash enable-gemini-pipeline.sh 2>&1 | sed 's/^/    /'); then
-            ok "Gemini pipeline enabled"
+    if ! prompt_gemini_key; then
+        skip "Gemini activation (no key)"
+        incomplete "meeting transcription uses Gemini only once a key is at $GEMINI_KEY_FILE (or switch engines: meeting-capture stt)"
+        return 0
+    fi
+    # Each owner switches its own setting: memory → contorch-memory embeddings
+    # (~/.context-orchestrator/env), recorder → meeting-capture stt. Nothing
+    # here writes a launchd plist.
+    local mem="$CONTEXT_ORCH_DIR/.venv/bin/contorch-memory"
+    local mc="$MEETING_CAPTURE_DIR/.venv/bin/meeting-capture"
+    if [ -x "$mem" ] && "$mem" embeddings gemini 2>&1 | sed 's/^/    /'; then
+        ok "memory search: Gemini embeddings"
+    else
+        warn "could not switch memory search to Gemini"
+        incomplete "Gemini embeddings — re-run: $mem embeddings gemini"
+    fi
+    if [ -x "$mc" ] && "$mc" stt --json >/dev/null 2>&1; then
+        if "$mc" stt gemini 2>&1 | sed 's/^/    /'; then
+            ok "meeting transcription: Gemini"
         else
-            warn "Gemini activation had errors — re-run manually if needed:"
-            warn "  cd $CONTEXT_ORCH_DIR && bash enable-gemini-pipeline.sh"
-            incomplete "Gemini activation — re-run: cd $CONTEXT_ORCH_DIR && bash enable-gemini-pipeline.sh"
+            warn "could not switch meeting transcription to Gemini"
+            incomplete "Gemini transcription — re-run: $mc stt gemini"
         fi
     else
-        skip "Gemini activation (no key)"
-        incomplete "meeting transcription is OFF until a Gemini key is at $GEMINI_KEY_FILE"
+        warn "this meeting-capture has no \`stt\` command — update it, then run: meeting-capture stt gemini"
+        incomplete "Gemini transcription — update meeting-capture, then: meeting-capture stt gemini"
+    fi
+}
+
+# Restart the recorder through its owner: `meeting-capture restart` from 0.7;
+# older versions have no such command, so fall back to launchctl.
+restart_recorder() {
+    local mc="$MEETING_CAPTURE_DIR/.venv/bin/meeting-capture" v major minor
+    v="$("$mc" --version 2>/dev/null | awk '{print $NF}')"
+    major="${v%%.*}"; minor="${v#*.}"; minor="${minor%%.*}"
+    case "$major$minor" in *[!0-9]*|"") major=0; minor=0 ;; esac
+    if [ "$major" -gt 0 ] || [ "$minor" -ge 7 ]; then
+        "$mc" restart >/dev/null 2>&1 && ok "restarted meeting-capture" || true
+    else
+        launchctl kickstart -k "gui/$(id -u)/com.contorch.meeting-capture" 2>/dev/null && ok "restarted meeting-capture" || true
     fi
 }
 
@@ -327,7 +364,7 @@ open_tcc_panes() {
     ask "Press Enter once sysaudio is added and enabled (or Ctrl-C to do it later):"
     if [ -t 0 ]; then read -r _; else read -r _ < /dev/tty || true; fi
     # Bounce the capture daemon so it picks up the grant.
-    launchctl kickstart -k "gui/$(id -u)/com.contorch.meeting-capture" 2>/dev/null && ok "restarted meeting-capture" || true
+    restart_recorder
 }
 
 # ============================================================ final report
@@ -345,8 +382,8 @@ ${BOLD}Installed at:${RESET}
 ${BOLD}${YELLOW}Then:${RESET}
 
   ${CYAN}▶${RESET} ${BOLD}Restart Claude Code${RESET}
-       Quit and relaunch the app so it picks up the new MCP server +
-       UserPromptSubmit hook from ~/.claude/settings.json.
+       Quit and relaunch the app so it picks up the new MCP server and
+       the auto-context hook.
 
 ${BOLD}Verify everything works:${RESET}
   Click the ○ icon in your menu bar → ${BOLD}"Run end-to-end smoke test"${RESET}.
@@ -355,7 +392,7 @@ ${BOLD}Verify everything works:${RESET}
 ${BOLD}Useful one-liners:${RESET}
   launchctl list | grep com.contorch            ${DIM}# all daemons${RESET}
   curl http://127.0.0.1:8765/api/v2/heartbeat   ${DIM}# chroma daemon${RESET}
-  ~/.claude/hooks/auto-context.py < /dev/null   ${DIM}# probe the hook${RESET}
+  $CONTEXT_ORCH_DIR/.venv/bin/contorch-memory claude status   ${DIM}# Claude Code connection${RESET}
 
 EOF
 }

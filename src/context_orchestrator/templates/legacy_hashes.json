@@ -1,0 +1,17 @@
+{
+ "_comment": "sha256 of every version of files earlier installers copied into ~/.claude. A copy whose hash is listed was written by us and may be replaced; anything else is the user's and is kept. claude_md hashes are of the block text from its BEGIN marker to its END marker, stripped.",
+ "auto-context.py": [
+  "07e38c81b898ddf7033d3599401aace90818bc0cff9fb6aa1882c78ee1a3c870",
+  "9c309b32f9915c095271a11cbd7938d816e9d0687356674797c4f51a0919a878",
+  "c1d6014174eba6a805a43b42c175664f2a946a3e707e94e24c0f572fa8dbf4f8"
+ ],
+ "claude_md_block": [
+  "0089d9f75092cf1a9425819c99e66d38bac6ca0c2634b26e065ee14fc0644602",
+  "2d88b7ca87037056064a150c1102487151ae9b0bc95acb242656195a2ee488b4",
+  "c5123f7c4a99c0f5b7897cf82ede95a6bb8f9accd091bf78daf27b08df8b3794"
+ ],
+ "transcripts_skill": [
+  "bcd0cfe5c55c9806403c4ccb10b39537ca57dbb78893b081f62893382894455d",
+  "e659a4bea9da25f79b99fa1c563dd59843c0c2fe02f3b06bb8b0c280da13f3b8"
+ ]
+}

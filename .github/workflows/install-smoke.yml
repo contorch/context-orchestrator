@@ -12,7 +12,7 @@ name: install-smoke
 
 on:
   pull_request:
-    paths: ["bootstrap.sh", "setup.sh", "install-claude-context.sh", "enable-gemini-pipeline.sh", "src/**", "tests/**", "hooks/**", "pyproject.toml", ".github/workflows/install-smoke.yml"]
+    paths: ["bootstrap.sh", "setup.sh", "install-claude-context.sh", "scripts/**", "src/**", "tests/**", "hooks/**", "pyproject.toml", ".github/workflows/install-smoke.yml"]
   push:
     branches: [main]
   workflow_dispatch:
@@ -31,6 +31,16 @@ jobs:
           # The session lock is proven on exactly this chromadb (pyproject pin).
           test "$(python -c 'from importlib.metadata import version; print(version("chromadb"))')" = 1.5.9
           python -m pytest -q tests
+      - name: "M1 exit criteria in a scratch HOME (lite: in-process index)"
+        run: |
+          set -euo pipefail
+          export HOME="$RUNNER_TEMP/lite-home" CO_EMBEDDING_MODEL=local
+          mkdir -p "$HOME"
+          echo "[10:00:01] Jane: the zebra migration ships Thursday" | contorch-transcripts add - --title "Zebra sync"
+          contorch-memory status --json | python3 -c 'import json,sys; d=json.load(sys.stdin); assert d["schema"]=="contorch-memory.status/1" and d["vector_index"]=="in_process" and d["index_compatible"]'
+          contorch-memory selftest --json | jq -e '.ok and .stage == "done"'
+          contorch-memory backup --to "$RUNNER_TEMP/b" --json | jq -e .ok
+          contorch-memory where --json | jq -e '.mcp | endswith("/contorch-mcp")'
 
   slow:
     # Multi-process in-process-Chroma stress (writers + long-lived MCP servers
@@ -62,10 +72,27 @@ jobs:
         run: |
           set -euo pipefail
           /bin/bash --version | head -1
-          for f in bootstrap.sh setup.sh install-claude-context.sh enable-gemini-pipeline.sh; do /bin/bash -n "$f"; done
-          ! grep -nE 'mapfile|readarray|declare -A|\$\{[a-zA-Z_]+(,,|\^\^)|&>>|\[\[ -v|read -i|coproc' bootstrap.sh setup.sh install-claude-context.sh enable-gemini-pipeline.sh
+          for f in bootstrap.sh setup.sh install-claude-context.sh scripts/contorch_channel_guard.sh tests/bootstrap_guard_test.sh tests/test_no_claude_edit_in_bash.sh tests/test_no_recorder_plist_writes.sh; do /bin/bash -n "$f"; done
+          ! grep -nE 'mapfile|readarray|declare -A|\$\{[a-zA-Z_]+(,,|\^\^)|&>>|\[\[ -v|read -i|coproc' bootstrap.sh setup.sh install-claude-context.sh scripts/contorch_channel_guard.sh tests/bootstrap_guard_test.sh tests/test_no_claude_edit_in_bash.sh tests/test_no_recorder_plist_writes.sh
           # "$name…" — bash 3.2 in a UTF-8 locale reads the ellipsis as part of the name
-          ! grep -nP '\$[A-Za-z_][A-Za-z0-9_]*[^\x00-\x7F]' bootstrap.sh setup.sh install-claude-context.sh enable-gemini-pipeline.sh
+          ! grep -nP '\$[A-Za-z_][A-Za-z0-9_]*[^\x00-\x7F]' bootstrap.sh setup.sh install-claude-context.sh scripts/contorch_channel_guard.sh tests/bootstrap_guard_test.sh tests/test_no_claude_edit_in_bash.sh tests/test_no_recorder_plist_writes.sh
+      - name: "no shell script edits Claude Code directly (one owner: contorch-memory claude)"
+        run: /bin/bash tests/test_no_claude_edit_in_bash.sh
+      - name: "no recorder settings / API key written into a plist; enable-gemini-pipeline.sh stays deleted"
+        run: |
+          /bin/bash tests/test_no_recorder_plist_writes.sh
+          test -z "$(git ls-files enable-gemini-pipeline.sh)"
+      - name: channel guard reader over every pipeline-monitor fixture (bash 3.2, no tty, UTF-8)
+        run: |
+          set -euo pipefail
+          # the vendored fixtures are pipeline-monitor's, at the pinned commit
+          commit=$(awk '/^commit /{print $2}' tests/fixtures/channel_guard/PIN)
+          d=$(mktemp -d)
+          for f in $(awk 'NF==2 && $2 ~ /\.json$/ {print $2}' tests/fixtures/channel_guard/PIN); do
+            curl -fsSL "https://raw.githubusercontent.com/contorch/pipeline-monitor/$commit/contract/channel_guard/$f" -o "$d/$f"
+          done
+          (cd "$d" && grep -v '^#\|^commit' "$GITHUB_WORKSPACE/tests/fixtures/channel_guard/PIN" | shasum -a 256 -c -)
+          LANG=en_US.UTF-8 /bin/bash tests/bootstrap_guard_test.sh "$d" < /dev/null
       - name: entry guard survives bash -c and a pipe under set -u
         run: |
           set -euo pipefail
@@ -74,6 +101,34 @@ jobs:
           sed 's/^main() {$/main() { echo MAIN_REACHED; return 0; }; _unused() {/' bootstrap.sh > /tmp/guard.sh
           LANG=en_US.UTF-8 /bin/bash -c "$(cat /tmp/guard.sh)" | grep -q MAIN_REACHED
           LANG=en_US.UTF-8 cat /tmp/guard.sh | /bin/bash | grep -q MAIN_REACHED
+
+  guard:
+    # bootstrap.sh, the way contorch.com/install runs it, on a Mac that another
+    # install owns: it must stop with exit 3 before any venv / Claude / launchd step.
+    runs-on: macos-15
+    timeout-minutes: 15
+    needs: lint
+    steps:
+      - uses: actions/checkout@v4
+      - name: bootstrap stops at the channel guard
+        env:
+          LANG: en_US.UTF-8
+          LC_ALL: en_US.UTF-8
+          CONTORCH_NONINTERACTIVE: "1"
+          CONTEXT_ORCH_REPO: ${{ github.workspace }}
+        run: |
+          set +e
+          export HOME="$RUNNER_TEMP/guard-home" BASE_DIR="$RUNNER_TEMP/guard-base"
+          mkdir -p "$HOME/.contorch"
+          printf '%s' '{"schema":"contorch.channel/1","owner":"app","writers":["app"],"blocked_message":"GUARD-TEST: Contorch.app manages this Mac."}' > "$HOME/.contorch/channel.json"
+          /bin/bash -c "$(cat bootstrap.sh)" > /tmp/guard.log 2>&1 < /dev/null
+          status=$?
+          set -e
+          cat /tmp/guard.log
+          test "$status" -eq 3
+          grep -q "GUARD-TEST: Contorch.app manages this Mac." /tmp/guard.log
+          test ! -e "$BASE_DIR/context-orchestrator/.venv"
+          test ! -e "$HOME/Library/LaunchAgents/com.contorch.context-orchestrator-chroma.plist"
 
   install:
     runs-on: macos-15
@@ -114,12 +169,39 @@ jobs:
           # Daemon-free indexing: the watcher agent must NOT be installed.
           test ! -f "$HOME/Library/LaunchAgents/com.contorch.transcript-watcher.plist"
           test -f "$HOME/Library/LaunchAgents/com.contorch.meeting-capture.plist"
-          test -x "$HOME/.claude/hooks/auto-context.py"
-          python3 -c "import json; h=json.load(open('$HOME/.claude/settings.json'))['hooks']['UserPromptSubmit']; assert h, 'hook not wired'"
+          # Claude Code integration (contorch-memory claude install): the guarded,
+          # tagged hook entry, the CLAUDE.md block, the rendered skill. The
+          # runner has no `claude` CLI, so the MCP entry is a to-do there.
+          M="$B/context-orchestrator/.venv/bin/contorch-memory"
+          "$M" claude status --json | tee /tmp/claude-status.json | jq -e '.hook.matches and .claude_md.matches and .skill.matches'
+          jq -e '.hooks.UserPromptSubmit | map(.hooks[]) | map(select(.command | test("# contorch-hook:dev$"))) | length == 1 and (.[0].timeout == 10) and (.[0].command | startswith("[ -x "))' "$HOME/.claude/settings.json"
+          HOOK_CMD=$(jq -r '.hooks.UserPromptSubmit | map(.hooks[]) | map(select(.command | test("contorch-hook"))) | .[0].command' "$HOME/.claude/settings.json")
+          echo '{"prompt":"when does the zebra migration ship?","cwd":"/tmp"}' | /bin/sh -c "$HOOK_CMD" | jq -e 'has("additionalContext")'
+          test ! -e "$HOME/.claude/hooks/auto-context.py"
+          grep -q "<!-- contorch -->" "$HOME/.claude/CLAUDE.md"
+          grep -q "^CT=.*contorch-transcripts" "$HOME/.claude/skills/transcripts/SKILL.md"
           curl -fsS http://127.0.0.1:8765/api/v2/heartbeat
           "$B/context-orchestrator/.venv/bin/transcript-watcher" doctor
           "$B/meeting-capture/.venv/bin/meeting-capture" doctor || true   # TCC grants can't exist on a runner
           grep -q "Not done yet" /tmp/bootstrap.log && grep -A6 "Not done yet" /tmp/bootstrap.log
+      - name: "memory status / selftest / backup against the chroma server (stop + restart via launchctl)"
+        run: |
+          set -euo pipefail
+          M=/Users/runner/contorch-ci/context-orchestrator/.venv/bin/contorch-memory
+          "$M" status --json | jq -e '.vector_index == "server" and .ok'
+          "$M" selftest --json | jq -e '.ok'
+          refused=$("$M" backup --to "$RUNNER_TEMP/srv-b" --json || true)
+          echo "$refused" | jq -e '.ok == false and .error.code == "server_running"'
+          "$M" backup --to "$RUNNER_TEMP/srv-b2" --stop-server --json | tee /tmp/backup.json | jq -e '.ok and .server_restarted'
+          curl -fsS http://127.0.0.1:8765/api/v2/heartbeat
+      - name: claude install in a scratch CLAUDE_CONFIG_DIR is guarded and idempotent
+        run: |
+          set -euo pipefail
+          M=/Users/runner/contorch-ci/context-orchestrator/.venv/bin/contorch-memory
+          export CLAUDE_CONFIG_DIR="$RUNNER_TEMP/claude cfg"
+          "$M" claude install --channel dev --json | jq -e '.ok and .hook.matches'
+          jq -e '.hooks.UserPromptSubmit[0].hooks[0].command | test("^\\[ -x .+ \\] && .+; exit 0 # contorch-hook:dev$")' "$CLAUDE_CONFIG_DIR/settings.json"
+          "$M" claude install --channel dev --json | jq -e '.changed == [] and .hook.matches and .claude_md.matches and .skill.matches'
       - name: The MCP server Claude Code will launch actually answers
         run: |
           set -euo pipefail

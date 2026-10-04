@@ -25,6 +25,8 @@ context-orchestrator-chroma = "context_orchestrator.chroma_daemon:main"
 # The MCP server as a real executable, so a packaged install (Homebrew) can
 # register one stable path with `claude mcp add` instead of python -m + PYTHONPATH.
 contorch-mcp = "context_orchestrator.server:main"
+# Claude Code's UserPromptSubmit hook (installed by `contorch-memory claude install`).
+contorch-hook = "context_orchestrator.hook:main"
 
 [project.optional-dependencies]
 dev = ["pytest>=7.0"]

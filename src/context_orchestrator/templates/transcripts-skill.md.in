@@ -15,10 +15,10 @@ Two ways in, same result:
 - **CLI** `contorch-transcripts` — for anything long or bulky (big transcripts, zips, bundles), so the
   text goes file → database without passing through the conversation.
 
-Find the CLI once per session:
+The CLI on this machine (written here by `contorch-memory claude install`):
 
 ```bash
-CT=$(command -v contorch-transcripts || ls ~/.context-orchestrator/venv/bin/contorch-transcripts ~/.contorch-lite/bin/contorch-transcripts 2>/dev/null | head -1); echo "$CT"
+CT={{CONTORCH_TRANSCRIPTS}}
 ```
 
 ## Adding a transcript

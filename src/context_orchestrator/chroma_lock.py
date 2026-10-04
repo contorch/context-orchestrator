@@ -40,7 +40,7 @@ from typing import Iterator, Optional
 DEFAULT_TIMEOUT_S = 60.0
 # The per-prompt hook must never hold up a prompt: it waits this long, then
 # answers from SQLite full-text search alone.
-HOOK_TIMEOUT_S = 2.0
+HOOK_LOCK_WAIT_S = 2.0
 
 _POLL_S = 0.02
 

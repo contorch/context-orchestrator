@@ -13,11 +13,13 @@ import argparse
 import os
 import plistlib
 import socket
-import subprocess
 import sys
 from pathlib import Path
 
-import chromadb
+from .launchd import launchctl
+
+# chromadb is imported where it is used: `contorch-memory status` and the
+# claude installer read LAUNCHD_PLIST without loading Chroma.
 
 CHROMA_PATH = Path.home() / ".context-orchestrator" / "chroma"
 LOG_DIR = Path.home() / ".context-orchestrator"
@@ -79,6 +81,7 @@ def is_listening(host: str = DEFAULT_HOST, port: int = DEFAULT_PORT, timeout: fl
 def heartbeat(host: str = DEFAULT_HOST, port: int = DEFAULT_PORT) -> tuple[bool, str]:
     """Round-trip a count() against the chroma server. Returns (ok, message)."""
     try:
+        import chromadb
         client = chromadb.HttpClient(host=host, port=port)
         col = client.get_or_create_collection("context")
         return True, f"{col.count()} documents"
@@ -91,18 +94,14 @@ def cmd_install(args) -> int:
     CHROMA_PATH.mkdir(parents=True, exist_ok=True)
     LAUNCHD_PLIST.parent.mkdir(parents=True, exist_ok=True)
     if LEGACY_PLIST.exists():
-        subprocess.run(["launchctl", "unload", "-w", str(LEGACY_PLIST)],
-                       check=False, stderr=subprocess.DEVNULL)
+        launchctl("unload", "-w", str(LEGACY_PLIST), quiet=True)
         LEGACY_PLIST.unlink()
         print(f"retired legacy agent {LEGACY_PLIST.name}")
     LAUNCHD_PLIST.write_bytes(
         _plist_payload(sys.executable, args.host, args.port, CHROMA_PATH)
     )
-    subprocess.run(
-        ["launchctl", "unload", str(LAUNCHD_PLIST)],
-        check=False, stderr=subprocess.DEVNULL,
-    )
-    subprocess.run(["launchctl", "load", "-w", str(LAUNCHD_PLIST)], check=False)
+    launchctl("unload", str(LAUNCHD_PLIST), quiet=True)
+    launchctl("load", "-w", str(LAUNCHD_PLIST))
     print(f"installed launchd agent at {LAUNCHD_PLIST}")
     print(f"chroma server: http://{args.host}:{args.port} (path: {CHROMA_PATH})")
     return 0
@@ -112,7 +111,7 @@ def cmd_uninstall(_args) -> int:
     if not LAUNCHD_PLIST.exists():
         print("launchd agent not installed")
         return 0
-    subprocess.run(["launchctl", "unload", "-w", str(LAUNCHD_PLIST)], check=False)
+    launchctl("unload", "-w", str(LAUNCHD_PLIST))
     LAUNCHD_PLIST.unlink()
     print(f"removed {LAUNCHD_PLIST}")
     return 0
@@ -124,10 +123,7 @@ def cmd_status(args) -> int:
     print(f"  log file:   {LOG_FILE}")
     print(f"  launchd:    {'installed' if LAUNCHD_PLIST.exists() else 'not installed'}")
     if LAUNCHD_PLIST.exists():
-        loaded = subprocess.run(
-            ["launchctl", "list", LAUNCHD_LABEL],
-            capture_output=True, text=True,
-        ).returncode == 0
+        loaded = launchctl("list", LAUNCHD_LABEL, capture=True).returncode == 0
         print(f"  loaded:     {'yes' if loaded else 'no'}")
     listening = is_listening(args.host, args.port)
     print(f"  listening:  {'yes' if listening else 'no'} ({args.host}:{args.port})")
