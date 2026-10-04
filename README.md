@@ -53,7 +53,7 @@ mkdir -p ~/.claude/skills/transcripts && curl -fsSL \
   -o ~/.claude/skills/transcripts/SKILL.md
 ```
 
-With no chroma launchd agent installed, the index is opened from `~/.context-orchestrator/chroma/` directly (several Claude Code sessions can share it). A Gemini key is optional here: without one, vectors come from embedding bundles made on another machine (`contorch-transcripts embed … -o bundle.jsonl` there, `contorch-transcripts import bundle.jsonl` here) and `search` falls back to keyword matching for the query. With a key (`~/.config/google/key`), transcripts are embedded locally and search is semantic.
+With no chroma launchd agent installed, the index is opened from `~/.context-orchestrator/chroma/` directly. Several processes share it (one MCP server per Claude Code session, the CLIs, the auto-context hook), and chromadb is not process-safe on a shared folder, so every operation runs inside one cross-process lock (`~/.context-orchestrator/chroma.lock`): open fresh, operate, close. Embeddings are computed before the lock is taken; the hook waits at most 2 s for it and otherwise answers from full-text search. chromadb is pinned (1.5.9) because the lock was proven on that version — see `tests/test_chroma_concurrency.py` (`pytest -m slow`). A Gemini key is optional here: without one, vectors come from embedding bundles made on another machine (`contorch-transcripts embed … -o bundle.jsonl` there, `contorch-transcripts import bundle.jsonl` here) and `search` falls back to keyword matching for the query. With a key (`~/.config/google/key`), transcripts are embedded locally and search is semantic.
 
 After any install path, restart Claude Code so the new MCP server is loaded.
 

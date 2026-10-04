@@ -4,6 +4,19 @@ import os
 import tempfile
 from pathlib import Path
 
+# A scratch HOME for the whole run, set before anything computes
+# Path.home(): no test may read or write the developer's real
+# ~/.context-orchestrator, ~/.claude or ~/.config. Only chromadb's downloaded
+# ONNX model (~80 MB, read-only use) is shared, so it isn't fetched every run.
+_REAL_HOME = Path.home()
+_SCRATCH_HOME = Path(tempfile.mkdtemp(prefix="co-tests-home-"))
+_model_cache = _REAL_HOME / ".cache" / "chroma"
+if _model_cache.is_dir():
+    (_SCRATCH_HOME / ".cache").mkdir()
+    (_SCRATCH_HOME / ".cache" / "chroma").symlink_to(_model_cache)
+os.environ["HOME"] = str(_SCRATCH_HOME)
+os.environ.pop("CLAUDE_CONFIG_DIR", None)
+
 # Set before any context_orchestrator import. Each test that needs isolation
 # overrides server.vs / server.db with its own tmp_path-scoped instance, so
 # this only matters for module-level instantiation in server.py.
@@ -35,3 +48,6 @@ def _no_real_gemini_key(monkeypatch, tmp_path):
     # ~/.context-orchestrator/backups from a test.
     from context_orchestrator import transcripts
     monkeypatch.setattr(transcripts, "BACKUP_DIR", tmp_path / "backups")
+    # Nothing may resolve to the real ~/.context-orchestrator/chroma (HTTP mode
+    # keeps its collection-name map there).
+    monkeypatch.setattr(search, "DEFAULT_CHROMA_PATH", tmp_path / "default-chroma")

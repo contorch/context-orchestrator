@@ -108,7 +108,7 @@ def main(argv: list[str] | None = None) -> int:
     pending = len(db.transcripts_to_index(float("inf"), vs.identity))
     print(f"embeddings:  {describe(embedding_choice())}")
     print(f"transcripts: {total} stored, {pending} not yet embedded with this model")
-    print(f"vector index: {vs.count()} chunks" + (f" (collection {vs.collection.name})" if vs.enabled else ""))
+    print(f"vector index: {vs.count()} chunks" + (f" (collection {vs.collection_name})" if vs.enabled else ""))
     print("full-text:   on")
     return 0
 

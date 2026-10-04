@@ -90,7 +90,8 @@ def test_scan_indexes_rows_written_straight_to_the_db(vs, db, watch_dir, state_f
     db.put_transcript(M1, "[10:00:00] **Me:** we agreed to raise prices in March for all tiers",
                       now=time.time() - 120)
     assert watcher.scan_once(vs, watch_dir, {}, db=db) == [M1]
-    hit = vs.collection.get(where={"meeting_id": M1}, include=["metadatas"])["metadatas"][0]
+    with vs.session() as col:
+        hit = col.get(where={"meeting_id": M1}, include=["metadatas"])["metadatas"][0]
     assert hit["type"] == "transcript" and hit["chunk_type"] == "speech"
     assert watcher.scan_once(vs, watch_dir, {}, db=db) == []
 

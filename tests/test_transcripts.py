@@ -60,7 +60,8 @@ def test_index_row_gives_timestamped_searchable_chunks(db, vs):
     mid, _ = T.add_text(db, VTT, title="Jane", started_at="2026-09-28T14:00:00")
     n = T.index_row(vs, db, db.get_transcript(mid))
     assert n == 1
-    meta = vs.collection.get(where={"meeting_id": mid}, include=["metadatas"])["metadatas"][0]
+    with vs.session() as col:
+        meta = col.get(where={"meeting_id": mid}, include=["metadatas"])["metadatas"][0]
     assert meta["chunk_type"] == "speech" and meta["title"] == "Jane"
     assert meta["start_ts_iso"].startswith("2026-09-28T14:00:05")
     assert db.count_transcripts() == (1, 0)
@@ -71,13 +72,14 @@ def test_failed_embedding_keeps_text_and_old_chunks(db, vs, monkeypatch):
     T.index_row(vs, db, db.get_transcript(mid))
     db.put_transcript(mid, "[14:00:01] Host: version two of the notes on pricing", now=time.time() + 1)
 
-    def boom(**_kw):
+    def boom(*_a, **_kw):
         raise RuntimeError("API key not valid")
-    monkeypatch.setattr(vs.collection, "upsert", boom)
+    monkeypatch.setattr(vs, "embed_documents", boom)
     assert T.index_pending(vs, db, settle_seconds=0, now=time.time() + 5) == []
     assert "version two" in db.get_transcript(mid)["body"]
     assert db.count_transcripts() == (1, 1), "still pending, retried later"
-    docs = vs.collection.get(where={"meeting_id": mid})["documents"]
+    with vs.session() as col:
+        docs = col.get(where={"meeting_id": mid})["documents"]
     assert docs and "version one" in docs[0], "previous index entries stay searchable"
 
 
@@ -144,11 +146,12 @@ def test_bundle_round_trip_loads_vectors_without_embedding(db, tmp_path, monkeyp
     monkeypatch.setattr(T, "_ef_identity", lambda ef: "fake-ef")
     def no_embedding(*a, **k):
         raise AssertionError("import must not call the embedding API")
-    monkeypatch.setattr(vs.collection, "_embedding_function", no_embedding, raising=False)
+    monkeypatch.setattr(vs, "embed_documents", no_embedding)
 
     stats = T.import_bundle(vs, db, bundle)
     assert stats["vectors_loaded"] == 1 and stats["compatible"]
-    got = vs.collection.get(where={"meeting_id": mid}, include=["embeddings"])
+    with vs.session() as col:
+        got = col.get(where={"meeting_id": mid}, include=["embeddings"])
     assert len(got["embeddings"][0]) == 8
     assert db.count_transcripts() == (1, 0)
     # Same bundle again: nothing to do.
@@ -166,16 +169,16 @@ def test_bundle_from_another_model_stores_text_only(db, tmp_path):
     stats = T.import_bundle(vs, db, bundle)
     assert not stats["compatible"] and stats["pending"] == 1
     assert db.get_transcript(mid) is not None
-    assert vs.collection.count() == 0
+    assert vs.count() == 0
 
 
 def test_search_falls_back_to_keywords_when_the_query_cannot_be_embedded(db, vs, monkeypatch):
     mid, _ = T.add_text(db, VTT, title="Jane", started_at="2026-09-28T14:00:00")
     T.index_row(vs, db, db.get_transcript(mid))
 
-    def no_key(**_kw):
+    def no_key(*_a, **_kw):
         raise RuntimeError("needs a Gemini API key")
-    monkeypatch.setattr(vs.collection, "query", no_key)
+    monkeypatch.setattr(vs, "embed_query", no_key)
     hits = vs.search("annual pricing revenue", hybrid=True, mmr=True)
     assert hits and hits[0]["metadata"]["meeting_id"] == mid
     assert vs.search("annual pricing", where={"meeting_id": "someone-else"}) == []
@@ -293,7 +296,7 @@ def test_switching_models_uses_a_new_collection_and_reindexes(tmp_path, monkeypa
     mid, _ = T.add_text(db, VTT, title="Jane", started_at="2026-09-28T14:00:00")
     monkeypatch.setenv("CO_EMBEDDING_MODEL", "local")
     local = VectorSearch(chroma_path=chroma)
-    assert local.collection.name == "context"               # first model keeps the old name
+    assert local.collection_name == "context"               # first model keeps the old name
     assert T.index_pending(local, db, settle_seconds=0, now=time.time() + 5) == [mid]
     assert T.index_pending(local, db, settle_seconds=0, now=time.time() + 5) == []
 

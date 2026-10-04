@@ -12,6 +12,8 @@ Sources, in priority order:
 Designed to be FAST (sub-2s) and FAIL SILENTLY — a slow or broken hook
 must never block the user's prompt. Total timeout: 10s (per Claude Code).
 """
+from __future__ import annotations
+
 import json
 import os
 import subprocess
@@ -79,31 +81,21 @@ def gather_git_context(cwd: str) -> str:
 def gather_orch_context(prompt: str, project_url: str) -> str:
     """Semantic search context-orch. Returns formatted top hits or ''.
 
-    Calls VectorSearch directly to avoid spawn overhead.
+    Runs context_orchestrator.hook.search_lines in the context-orchestrator venv.
     """
     if not CTX_ORCH_VENV or not Path(CTX_ORCH_VENV).exists():
         return ""
-    # Run in a subprocess so import errors / Chroma daemon down don't kill the hook
-    where = {"project": project_url} if project_url else None
+    # Run in a subprocess so import errors / Chroma daemon down don't kill the hook.
+    # context_orchestrator.hook waits at most 2 s for the in-process Chroma
+    # session lock, then answers from SQLite full-text search alone.
     code = f'''
 import sys
 sys.path.insert(0, {CTX_ORCH_DB_PYPATH!r})
 try:
-    from context_orchestrator.search import VectorSearch
-    vs = VectorSearch()
-    # Try project-scoped first; fall back to global if no hits.
-    hits = vs.search(query={prompt!r}, where={where!r}, n_results=5,
-                     hybrid=True, mmr=True) if {bool(where)} else []
-    if not hits:
-        hits = vs.search(query={prompt!r}, n_results=5, hybrid=True, mmr=True)
-    out = []
-    for h in hits[:5]:
-        meta = h.get("metadata", {{}})
-        label = meta.get("repo_url") or meta.get("task_name") or meta.get("type", "?")
-        text = (h.get("text") or "")[:280].replace("\\n", " ")
-        out.append(f"- [{{label}}] {{text}}")
-    print("\\n".join(out))
-except Exception as e:
+    from context_orchestrator.hook import search_lines
+    lines, _mode = search_lines({prompt!r}, {project_url!r})
+    print("\\n".join(lines))
+except Exception:
     pass
 '''
     try:
