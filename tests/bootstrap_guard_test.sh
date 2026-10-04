@@ -14,8 +14,12 @@ trap 'rm -rf "$WORK"' EXIT
 pass=0
 failn=0
 
-field() {  # field FILE KEYPATH -> raw value, or nothing
-    plutil -extract "$2" raw -o - "$1" 2>/dev/null
+field() {  # field FILE KEYPATH -> raw value; nothing and status 1 if absent
+    # (some macOS versions print plutil's error on stdout, so keep the output
+    # only when plutil succeeded)
+    local v
+    v=$(plutil -extract "$2" raw -o - "$1" 2>/dev/null) || return 1
+    printf '%s' "$v"
 }
 
 for f in "$FIX"/*.json; do
@@ -24,9 +28,10 @@ for f in "$FIX"/*.json; do
     mkdir -p "$home/.contorch"
     if raw=$(field "$f" marker_raw); then
         printf '%s' "$raw" > "$home/.contorch/channel.json"
-    elif plutil -extract marker json -o "$home/.contorch/channel.json" "$f" 2>/dev/null; then
-        :
+    elif plutil -extract marker json -o "$WORK/marker.tmp" "$f" >/dev/null 2>&1; then
+        mv "$WORK/marker.tmp" "$home/.contorch/channel.json"
     fi
+    rm -f "$WORK/marker.tmp"   # `"marker": null`: plutil fails, no file
     # `"marker": null` → no file (plutil can't extract null)
     want="$(field "$f" expect.exit)"
     want_err="$(field "$f" expect.stderr || true)"
