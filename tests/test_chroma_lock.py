@@ -179,7 +179,7 @@ def test_hook_waits_at_most_two_seconds_then_answers_keyword_only(tmp_path, monk
                                                                   held_by_other_process):
     from context_orchestrator import hook
     from context_orchestrator.db import Database
-    assert chroma_lock.HOOK_TIMEOUT_S == 2.0
+    assert chroma_lock.HOOK_LOCK_WAIT_S == 2.0
     monkeypatch.setattr(search, "_build_embedding_function", lambda: _FakeEF())
     chroma = tmp_path / "chroma"
     monkeypatch.setenv("CO_CHROMA_PATH", str(chroma))

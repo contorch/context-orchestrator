@@ -1,0 +1,17 @@
+{
+  "description": "CONTORCH_CHANNEL unset means dev; dev is a writer",
+  "env": {},
+  "expect": {
+    "exit": 0
+  },
+  "marker": {
+    "schema": "contorch.channel/1",
+    "owner": "dev",
+    "state": "ok",
+    "writers": [
+      "dev"
+    ],
+    "blocked_message": "Contorch on this Mac is managed by Contorch.app. Use the app's menu (Contorch › Set Up Contorch…).",
+    "updated_at": "2026-10-03T12:00:00Z"
+  }
+}

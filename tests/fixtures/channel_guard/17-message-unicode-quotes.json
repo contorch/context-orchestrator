@@ -1,0 +1,20 @@
+{
+  "description": "the message is printed verbatim, UTF-8 included",
+  "env": {
+    "CONTORCH_CHANNEL": "brew"
+  },
+  "expect": {
+    "exit": 3,
+    "stderr": "Contorch.app manages this Mac — open the app’s menu."
+  },
+  "marker": {
+    "schema": "contorch.channel/1",
+    "owner": "app",
+    "state": "ok",
+    "writers": [
+      "app"
+    ],
+    "blocked_message": "Contorch.app manages this Mac — open the app’s menu.",
+    "updated_at": "2026-10-03T12:00:00Z"
+  }
+}

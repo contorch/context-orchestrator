@@ -1,0 +1,26 @@
+{
+  "description": "the operation's own child (CONTORCH_OP = op.id) may write",
+  "env": {
+    "CONTORCH_CHANNEL": "brew",
+    "CONTORCH_OP": "op-7f3a"
+  },
+  "expect": {
+    "exit": 0
+  },
+  "marker": {
+    "schema": "contorch.channel/1",
+    "owner": "app",
+    "state": "adopting",
+    "writers": [
+      "app",
+      "brew"
+    ],
+    "blocked_message": "Contorch on this Mac is managed by Contorch.app. Use the app's menu (Contorch › Set Up Contorch…).",
+    "updated_at": "2026-10-03T12:00:00Z",
+    "op": {
+      "id": "op-7f3a",
+      "kind": "adopt",
+      "by": "app"
+    }
+  }
+}

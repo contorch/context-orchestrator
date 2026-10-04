@@ -751,7 +751,10 @@ def _fuse(dense: list[dict], text_hits: list[dict], limit: int, k: int = 60) -> 
 
 def main():
     logger.info(f"Starting context-orchestrator, db={db.db_path}")
-    mcp.run(transport="stdio")
+    # stdio with the re-exec guard: survives a venv rebuild / app update
+    # under a long-lived Claude Code session (stdio_guard.py).
+    from context_orchestrator import stdio_guard
+    stdio_guard.run(mcp)
 
 
 if __name__ == "__main__":

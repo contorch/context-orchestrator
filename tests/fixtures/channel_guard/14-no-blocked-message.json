@@ -1,0 +1,19 @@
+{
+  "description": "blocked without a message: the reader prints its own",
+  "env": {
+    "CONTORCH_CHANNEL": "dev"
+  },
+  "expect": {
+    "exit": 3,
+    "stderr_contains": "managed by another install"
+  },
+  "marker": {
+    "schema": "contorch.channel/1",
+    "owner": "app",
+    "state": "ok",
+    "writers": [
+      "app"
+    ],
+    "updated_at": "2026-10-03T12:00:00Z"
+  }
+}

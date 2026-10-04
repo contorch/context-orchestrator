@@ -1,0 +1,19 @@
+{
+  "description": "an unknown CONTORCH_CHANNEL value means dev",
+  "env": {
+    "CONTORCH_CHANNEL": "nightly"
+  },
+  "expect": {
+    "exit": 0
+  },
+  "marker": {
+    "schema": "contorch.channel/1",
+    "owner": "dev",
+    "state": "ok",
+    "writers": [
+      "dev"
+    ],
+    "blocked_message": "Contorch on this Mac is managed by Contorch.app. Use the app's menu (Contorch › Set Up Contorch…).",
+    "updated_at": "2026-10-03T12:00:00Z"
+  }
+}

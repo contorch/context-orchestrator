@@ -1,0 +1,20 @@
+{
+  "description": "op: null is the same as no op",
+  "env": {
+    "CONTORCH_CHANNEL": "brew"
+  },
+  "expect": {
+    "exit": 0
+  },
+  "marker": {
+    "schema": "contorch.channel/1",
+    "owner": "brew",
+    "state": "ok",
+    "writers": [
+      "brew"
+    ],
+    "blocked_message": "Contorch on this Mac is managed by Contorch.app. Use the app's menu (Contorch › Set Up Contorch…).",
+    "updated_at": "2026-10-03T12:00:00Z",
+    "op": null
+  }
+}

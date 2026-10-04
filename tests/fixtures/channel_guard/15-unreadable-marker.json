@@ -1,0 +1,11 @@
+{
+  "description": "a marker that can't be parsed blocks (fail closed)",
+  "env": {
+    "CONTORCH_CHANNEL": "brew"
+  },
+  "expect": {
+    "exit": 3,
+    "stderr_contains": "managed by another install"
+  },
+  "marker_raw": "{not json"
+}

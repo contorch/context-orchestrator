@@ -519,7 +519,67 @@ def import_path(db, path: Path, delete: bool = False,
     return stats
 
 
+IMPORT_SCHEMA = "contorch-transcripts.import/1"
+
+
+def _cmd_import_json(args) -> int:
+    """JSON Lines on stdout: progress events, then {"event": "result", …}.
+    `embeddings` says how the imported text is searchable right now:
+      imported      vectors loaded from the bundle (no embedding call made)
+      embedded      embedded here
+      keyword_only  stored and full-text searchable; not in the vector index
+                    (vectors from another model/size, embeddings off, or the
+                    embedding call failed — e.g. no Gemini key)"""
+    from .jsonout import emit, error, reserved_stdout
+    with reserved_stdout() as out:
+        path = Path(args.path).expanduser()
+        res = {"event": "result", "schema": IMPORT_SCHEMA, "ok": False, "path": str(path)}
+        try:
+            db = _open_db()
+            if not path.exists():
+                res["error"] = error("not_found", f"not found: {path}")
+                emit(res, out)
+                return 1
+            if is_bundle(path):
+                emit({"event": "start", "kind": "bundle", "path": str(path)}, out)
+                vs = _open_vs()
+                stats = import_bundle(vs, db, path)
+                emit({"event": "stored", **stats}, out)
+                res.update(ok=True, kind="bundle", imported=stats["stored"], skipped=stats["unchanged"],
+                           vectors_loaded=stats["vectors_loaded"], pending=stats["pending"],
+                           compatible=stats["compatible"], text_only=stats["text_only"],
+                           embeddings="imported" if stats["vectors_loaded"] and not stats["pending"]
+                           else "keyword_only")
+            else:
+                emit({"event": "start", "kind": "files", "path": str(path)}, out)
+                try:
+                    stats = import_path(db, path, delete=args.delete)
+                except BackupError as exc:
+                    res["error"] = error("backup_failed", f"nothing deleted: {exc}")
+                    emit(res, out)
+                    return 1
+                emit({"event": "stored", **stats}, out)
+                res.update(ok=True, kind="files", imported=stats["stored"], skipped=stats["unchanged"],
+                           deleted=stats["deleted"], skipped_live=stats["skipped_live"],
+                           backup=stats["backup"])
+                if args.no_index:
+                    res["embeddings"] = "keyword_only"
+                else:
+                    vs = _open_vs()
+                    emit({"event": "indexing"}, out)
+                    done = index_pending(vs, db, settle_seconds=0) if vs.enabled else []
+                    total, pending = db.count_transcripts()
+                    res.update(indexed=len(done), pending=pending,
+                               embeddings="embedded" if vs.enabled and pending == 0 else "keyword_only")
+        except Exception as exc:
+            res["error"] = error("internal", f"{type(exc).__name__}: {exc}"[:400])
+        emit(res, out)
+        return 0 if res["ok"] else 1
+
+
 def _cmd_import(args) -> int:
+    if getattr(args, "json", False):
+        return _cmd_import_json(args)
     db = _open_db()
     path = Path(args.path).expanduser()
     if not path.exists():
@@ -697,6 +757,8 @@ def main(argv: Optional[list[str]] = None) -> int:
     s.add_argument("path")
     s.add_argument("--delete", action="store_true", help="delete each source file once it is stored")
     s.add_argument("--no-index", action="store_true", help="store only; embed on the next search")
+    s.add_argument("--json", action="store_true",
+                   help="JSON Lines progress on stdout, ending in {\"event\": \"result\", …}")
     s.set_defaults(func=_cmd_import)
     s = sub.add_parser("add", help="add one transcript with a title and start time")
     s.add_argument("path", help="file, or - for stdin")
