@@ -16,6 +16,9 @@ if _model_cache.is_dir():
     (_SCRATCH_HOME / ".cache" / "chroma").symlink_to(_model_cache)
 os.environ["HOME"] = str(_SCRATCH_HOME)
 os.environ.pop("CLAUDE_CONFIG_DIR", None)
+# launchd labels are per user, not per HOME: a test that reached launchctl
+# would replace the developer's real agents. Every call refuses instead.
+os.environ["CO_NO_LAUNCHCTL"] = "1"
 
 # Set before any context_orchestrator import. Each test that needs isolation
 # overrides server.vs / server.db with its own tmp_path-scoped instance, so

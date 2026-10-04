@@ -94,6 +94,19 @@ Long-lived process spawned by Claude Code on session start. Exposes the tools ab
 
 Older installs are migrated: a copied `~/.claude/hooks/auto-context.py`, the old `CONTEXT-ORCHESTRATOR` / `auto-context-section` CLAUDE.md blocks and a curl'ed skill are replaced only when they are byte-identical to a version we shipped; edited copies are kept and reported as a to-do. `uninstall` removes only what carries Contorch's tag, marker or stamp. Claude Code's files follow `CLAUDE_CONFIG_DIR`; managed settings that block hooks or MCP servers are detected and reported (`blocked_by_managed_settings`). Running the same install twice changes nothing.
 
+### Memory status, self-test and data operations (`contorch-memory`)
+
+Every `--json` form prints one JSON document on stdout (human text goes to stderr):
+
+| Command | What it does |
+|---|---|
+| `status --json [--deep]` | `contorch-memory.status/1`: embeddings, `vector_index` (`server` / `in_process` / `none`), docs, transcripts, pending, `chromadb_version`, `index_written_by`, `index_compatible`. Doesn't import chromadb unless `--deep`. |
+| `selftest --json` | Writes, searches and deletes a marker document. Reports the stage reached and an error code (`offline`, `proxy`, `tls`, `key`, `quota`, `busy`, `db`). |
+| `where --json` | Absolute paths of this install's `contorch-mcp`, `contorch-hook`, `contorch-transcripts`, the skill, the DB and the index. |
+| `backup --to DIR [--stop-server] --json` | `context.db` through SQLite's backup API (integrity check + FTS counts), and the index copied under the session lock. The copy is reopened and every collection is counted; a copy that doesn't verify is `backup_unverified`. Refuses `server_running` unless `--stop-server`. |
+| `restore --from DIR [--stop-server] --json` | Puts a backup's index back (the current one is moved aside) and verifies the counts. `context.db` is never rolled back. |
+| `index migrate --in-process [--backup-dir DIR] --json` | Retires the chroma server: backs up with the server stopped, removes its agent, and counts the same folder in-process. |
+
 ### chroma server
 
 The vector index is served by a `chroma run` HTTP daemon (launchd-managed) listening on `127.0.0.1:8765`. The MCP server, the watcher, and one-shot CLIs all connect as HTTP clients, which avoids the SQLite-lock contention that `PersistentClient`-per-process configurations are prone to under concurrent access. Override the host or port via the `CO_CHROMA_HOST` / `CO_CHROMA_PORT` environment variables. CLI:

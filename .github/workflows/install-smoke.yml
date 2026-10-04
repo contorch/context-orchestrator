@@ -31,6 +31,16 @@ jobs:
           # The session lock is proven on exactly this chromadb (pyproject pin).
           test "$(python -c 'from importlib.metadata import version; print(version("chromadb"))')" = 1.5.9
           python -m pytest -q tests
+      - name: "M1 exit criteria in a scratch HOME (lite: in-process index)"
+        run: |
+          set -euo pipefail
+          export HOME="$RUNNER_TEMP/lite-home" CO_EMBEDDING_MODEL=local
+          mkdir -p "$HOME"
+          echo "[10:00:01] Jane: the zebra migration ships Thursday" | contorch-transcripts add - --title "Zebra sync"
+          contorch-memory status --json | python3 -c 'import json,sys; d=json.load(sys.stdin); assert d["schema"]=="contorch-memory.status/1" and d["vector_index"]=="in_process" and d["index_compatible"]'
+          contorch-memory selftest --json | jq -e '.ok and .stage == "done"'
+          contorch-memory backup --to "$RUNNER_TEMP/b" --json | jq -e .ok
+          contorch-memory where --json | jq -e '.mcp | endswith("/contorch-mcp")'
 
   slow:
     # Multi-process in-process-Chroma stress (writers + long-lived MCP servers
@@ -131,6 +141,16 @@ jobs:
           "$B/context-orchestrator/.venv/bin/transcript-watcher" doctor
           "$B/meeting-capture/.venv/bin/meeting-capture" doctor || true   # TCC grants can't exist on a runner
           grep -q "Not done yet" /tmp/bootstrap.log && grep -A6 "Not done yet" /tmp/bootstrap.log
+      - name: "memory status / selftest / backup against the chroma server (stop + restart via launchctl)"
+        run: |
+          set -euo pipefail
+          M=/Users/runner/contorch-ci/context-orchestrator/.venv/bin/contorch-memory
+          "$M" status --json | jq -e '.vector_index == "server" and .ok'
+          "$M" selftest --json | jq -e '.ok'
+          refused=$("$M" backup --to "$RUNNER_TEMP/srv-b" --json || true)
+          echo "$refused" | jq -e '.ok == false and .error.code == "server_running"'
+          "$M" backup --to "$RUNNER_TEMP/srv-b2" --stop-server --json | tee /tmp/backup.json | jq -e '.ok and .server_restarted'
+          curl -fsS http://127.0.0.1:8765/api/v2/heartbeat
       - name: claude install in a scratch CLAUDE_CONFIG_DIR is guarded and idempotent
         run: |
           set -euo pipefail
