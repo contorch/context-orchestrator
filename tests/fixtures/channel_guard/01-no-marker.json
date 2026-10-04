@@ -1,0 +1,8 @@
+{
+  "description": "no marker: every installer may write",
+  "env": {},
+  "expect": {
+    "exit": 0
+  },
+  "marker": null
+}

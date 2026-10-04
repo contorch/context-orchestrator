@@ -1,0 +1,10 @@
+{
+  "description": "no marker, an explicit channel",
+  "env": {
+    "CONTORCH_CHANNEL": "brew"
+  },
+  "expect": {
+    "exit": 0
+  },
+  "marker": null
+}
