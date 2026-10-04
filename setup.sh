@@ -21,6 +21,12 @@ EOF
     esac
 done
 
+# Channel guard: another install (Contorch.app, Homebrew) may own this Mac.
+if [ -f "$SCRIPT_DIR/scripts/contorch_channel_guard.sh" ]; then
+    . "$SCRIPT_DIR/scripts/contorch_channel_guard.sh"
+    contorch_channel_guard || exit $?
+fi
+
 echo "Setting up context-orchestrator..."
 
 # ---------------------------------------------------------------------------
@@ -75,7 +81,9 @@ fi
 
 echo "Installing dependencies..."
 "$SCRIPT_DIR/.venv/bin/pip" install -q --upgrade pip
-"$SCRIPT_DIR/.venv/bin/pip" install -q -e "$SCRIPT_DIR"
+# [embeddings-gemini] always (as the brew formula does): `contorch-memory
+# embeddings gemini` then needs nothing else.
+"$SCRIPT_DIR/.venv/bin/pip" install -q -e "$SCRIPT_DIR[embeddings-gemini]"
 
 # ---------------------------------------------------------------------------
 # 2. Cut over to chroma HTTP server (single source of truth, no SQLite contention)

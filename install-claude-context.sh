@@ -31,6 +31,12 @@ for arg in "$@"; do
     esac
 done
 
+# Channel guard: another install (Contorch.app, Homebrew) may own this Mac.
+if [ -f "$REPO_ROOT/scripts/contorch_channel_guard.sh" ]; then
+    . "$REPO_ROOT/scripts/contorch_channel_guard.sh"
+    contorch_channel_guard || exit $?
+fi
+
 if [ ! -x "$MEMORY" ]; then
     echo "✗ $MEMORY not found — run setup.sh first" >&2
     exit 1

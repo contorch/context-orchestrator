@@ -38,25 +38,41 @@ CHOICES = {"gemini": "gemini-embedding-001", "local": "local", "none": "none"}
 
 
 def set_env_value(key: str, value: str, path: Path = ENV_FILE) -> None:
-    """Set KEY=value in the env file, keeping every other line."""
-    lines = []
-    try:
-        lines = path.read_text(encoding="utf-8").splitlines()
-    except OSError:
-        pass
-    out, done = [], False
-    for line in lines:
-        k = line.split("=", 1)[0].strip().removeprefix("export ").strip()
-        if k == key and not line.lstrip().startswith("#"):
+    """Set KEY=value in the env file, keeping every other line. Several
+    writers (setup, the menu bar, CLIs) may do this at once: an flock on
+    `<file>.lock` serialises read-modify-write, and the new file replaces the
+    old one atomically, so a reader never sees half a file (lab E8: 7-18 of 20
+    concurrent writes were lost without this)."""
+    import fcntl
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path.with_name(path.name + ".lock"), "a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        try:
+            lines = []
+            try:
+                lines = path.read_text(encoding="utf-8").splitlines()
+            except OSError:
+                pass
+            out, done = [], False
+            for line in lines:
+                k = line.split("=", 1)[0].strip().removeprefix("export ").strip()
+                if k == key and not line.lstrip().startswith("#"):
+                    if not done:
+                        out.append(f"{key}={value}")
+                        done = True
+                    continue
+                out.append(line)
             if not done:
                 out.append(f"{key}={value}")
-                done = True
-            continue
-        out.append(line)
-    if not done:
-        out.append(f"{key}={value}")
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text("\n".join(out) + "\n", encoding="utf-8")
+            tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+            tmp.write_text("\n".join(out) + "\n", encoding="utf-8")
+            try:
+                os.chmod(tmp, path.stat().st_mode & 0o777)
+            except FileNotFoundError:
+                pass
+            os.replace(tmp, path)
+        finally:
+            fcntl.flock(lock, fcntl.LOCK_UN)
 
 
 def describe(choice: str) -> str:

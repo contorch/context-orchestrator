@@ -107,6 +107,12 @@ Every `--json` form prints one JSON document on stdout (human text goes to stder
 | `restore --from DIR [--stop-server] --json` | Puts a backup's index back (the current one is moved aside) and verifies the counts. `context.db` is never rolled back. |
 | `index migrate --in-process [--backup-dir DIR] --json` | Retires the chroma server: backs up with the server stopped, removes its agent, and counts the same folder in-process. |
 
+### Installers and the channel guard
+
+Contorch can be installed as Contorch.app, with Homebrew, or from these checkouts (`bootstrap.sh`, `setup.sh`, `install-claude-context.sh`). When one of them owns the Mac, pipeline-monitor records it in `~/.contorch/channel.json`. The bash installers here source `scripts/contorch_channel_guard.sh` before any venv, Claude Code or launchd change. If this install isn't allowed to write, they print the marker's message and exit 3. The rule is pipeline-monitor's (see its `contract/channel_guard`, vendored in `tests/fixtures/channel_guard`).
+
+Gemini is switched on by each owner: `contorch-memory embeddings gemini` for search, `meeting-capture stt gemini` for transcription. `bootstrap.sh` calls both. The old `enable-gemini-pipeline.sh`, which wrote settings and the key into launchd plists, is gone.
+
 ### chroma server
 
 The vector index is served by a `chroma run` HTTP daemon (launchd-managed) listening on `127.0.0.1:8765`. The MCP server, the watcher, and one-shot CLIs all connect as HTTP clients, which avoids the SQLite-lock contention that `PersistentClient`-per-process configurations are prone to under concurrent access. Override the host or port via the `CO_CHROMA_HOST` / `CO_CHROMA_PORT` environment variables. CLI:
@@ -143,7 +149,7 @@ Every transcript is a row in the `transcripts` table (full text in `body`); Chro
 
 A bundle records the embedding function and vector size; `import` loads the vectors only when they match this index, otherwise it stores the text and embeds it locally.
 
-The `transcripts` Claude Code skill (installed by `contorch-memory claude install`) wraps all of this: give Claude a URL, a pasted transcript, a zip or a bundle and it stores it verbatim.
+`contorch-transcripts import … --json` prints JSON Lines progress ending in `{"event": "result", …}`, with `embeddings`: `imported` (the bundle's vectors were loaded), `embedded` (embedded here) or `keyword_only` (stored and full-text searchable, not yet in the vector index). The `transcripts` Claude Code skill (installed by `contorch-memory claude install`) wraps all of this: give Claude a URL, a pasted transcript, a zip or a bundle and it stores it verbatim.
 
 Moving from the old `~/transcripts/*.md` files: `contorch-transcripts import ~/transcripts --delete`.
 
