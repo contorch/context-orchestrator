@@ -723,9 +723,15 @@ def search(
 
 
 def _fuse(dense: list[dict], text_hits: list[dict], limit: int, k: int = 60) -> list[dict]:
-    """Reciprocal-rank fusion of vector hits and full-text hits. A transcript
-    found by both counts once, shown as the vector chunk (it carries the
-    chunk's own timestamp)."""
+    """Reciprocal-rank fusion of vector hits and full-text hits, one entry per
+    meeting. A transcript found by both counts once, shown as the vector chunk
+    (it carries the chunk's own timestamp).
+
+    Each list is collapsed to one entry per key BEFORE fusing: a meeting
+    contributes the rank of its best chunk only. Summing every chunk's 1/(k+r)
+    let a meeting with many mediocre chunks outrank the meeting holding the
+    right chunk (benchmark, 100 queries: meeting-level MRR 0.66-0.69 -> 0.84
+    for Gemini and EmbeddingGemma)."""
     def key_dense(h):
         m = h.get("metadata", {})
         return f"t:{m['meeting_id']}" if m.get("type") == "transcript" and m.get("meeting_id") else f"d:{h['id']}"
@@ -735,19 +741,22 @@ def _fuse(dense: list[dict], text_hits: list[dict], limit: int, k: int = 60) -> 
             return f"t:{h['meeting_id']}"
         return f"f:{h['kind']}:{h['text'][:80]}"
 
+    def best_per_key(hits, key_of):
+        seen: dict[str, dict] = {}
+        for h in hits:              # hits are best-first
+            seen.setdefault(key_of(h), h)
+        return list(seen.items())   # rank = position among distinct keys
+
     scores: dict[str, float] = {}
     items: dict[str, dict] = {}
-    for rank, h in enumerate(dense):
-        key = key_dense(h)
+    for rank, (key, h) in enumerate(best_per_key(dense, key_dense)):
         scores[key] = scores.get(key, 0.0) + 1.0 / (k + rank + 1)
         items.setdefault(key, h)
-    for rank, h in enumerate(text_hits):
-        key = key_text(h)
+    for rank, (key, h) in enumerate(best_per_key(text_hits, key_text)):
         scores[key] = scores.get(key, 0.0) + 1.0 / (k + rank + 1)
         items.setdefault(key, {**h, "fts": True})
     order = sorted(scores, key=lambda x: -scores[x])
     return [items[x] for x in order[:limit]]
-
 
 def main():
     logger.info(f"Starting context-orchestrator, db={db.db_path}")
