@@ -90,6 +90,10 @@ def run() -> dict:
         doc["stage"] = "index"
         vs = search.VectorSearch(lock_timeout=15, verify=False)
         doc["vector_index"] = "in_process" if vs.in_process else "server"
+        if vs.waiting_for_model:
+            from . import local_model
+            return finish(ok=True, stage="done", local_model=local_model.state(),
+                          note="keyword search until the on-device model is downloaded and verified")
         doc["stage"] = "embed"
         vec = vs.embed_documents([text])
         doc["stage"] = "write"

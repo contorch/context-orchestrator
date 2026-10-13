@@ -100,7 +100,8 @@ Every `--json` form prints one JSON document on stdout (human text goes to stder
 
 | Command | What it does |
 |---|---|
-| `status --json [--deep]` | `contorch-memory.status/1`: embeddings, `vector_index` (`server` / `in_process` / `none`), docs, transcripts, pending, `chromadb_version`, `index_written_by`, `index_compatible`. Doesn't import chromadb unless `--deep`. |
+| `status --json [--deep]` | `contorch-memory.status/1`: embeddings, `embedding_identity` (what search embeds with now), `vector_index` (`server` / `in_process` / `none`), docs, transcripts, pending, `chromadb_version`, `index_written_by`, `index_compatible`; for `local` / `embeddinggemma-2` also `embedding_target` and `local_model` {`state`: `absent` / `downloading` / `partial` / `failed` / `verified`, `bytes_done`, `bytes_total`, `percent`, `error`, `dir`}. Doesn't import chromadb (or onnxruntime) unless `--deep`. |
+| `model status\|download [--json]` | `contorch-memory.model/1`: the EmbeddingGemma 2 files; `download` fetches + verifies them now (progress on stderr). |
 | `selftest --json` | Writes, searches and deletes a marker document. Reports the stage reached and an error code (`offline`, `proxy`, `tls`, `key`, `quota`, `busy`, `db`). |
 | `where --json` | Absolute paths of this install's `contorch-mcp`, `contorch-hook`, `contorch-transcripts`, the skill, the DB and the index. |
 | `backup --to DIR [--stop-server] --json` | `context.db` through SQLite's backup API (integrity check + FTS counts), and the index copied under the session lock. The copy is reopened and every collection is counted; a copy that doesn't verify is `backup_unverified`. Refuses `server_running` unless `--stop-server`. |
@@ -130,10 +131,22 @@ The vector index is served by a `chroma run` HTTP daemon (launchd-managed) liste
 | `contorch-memory embeddings …` | Understands | Needs |
 |---|---|---|
 | `gemini` | paraphrases best | a Gemini key; text is sent to Google to embed |
-| `local` | paraphrases, less well | nothing — all-MiniLM-L6-v2 runs on this Mac (~80 MB, downloaded once) |
+| `local` | paraphrases nearly as well as Gemini; across languages | nothing — EmbeddingGemma 2 runs on this Mac (~243 MB, downloaded once); all-MiniLM-L6-v2 until that download is verified |
+| `eg2` (`embeddinggemma-2`, `local-gemma`) | same as `local` | the same download; keyword search (not MiniLM) until it is verified |
+| `minilm` | paraphrases, less well; English | nothing — all-MiniLM-L6-v2 runs on this Mac (~80 MB, downloaded once) |
 | `none` | exact words (stemmed) | nothing — nothing leaves this Mac |
 
-The choice is stored in `~/.context-orchestrator/env`; `contorch-memory status` shows it with counts. Each model gets its own Chroma collection and each transcript records which model embedded it, so switching re-embeds from the stored text (next search, or `contorch-transcripts reindex`) and switching back reuses the old vectors. Machines exchanging embedding bundles must use the same choice. The Contorch menu bar shows the mode on its Index line.
+Unset = `gemini` when a key exists, otherwise `local`. The choice is stored in `~/.context-orchestrator/env`; `contorch-memory status` shows it with counts. Each model gets its own Chroma collection and each transcript records which model embedded it (`indexed_with`), so switching re-embeds from the stored text (next search, or `contorch-transcripts reindex`) and switching back reuses the old vectors. Machines exchanging embedding bundles must use the same choice. The Contorch menu bar shows the mode on its Index line.
+
+Benchmark: 100 hand-written questions over 26 real meetings (chunk-level MRR@10): Gemini 0.89, EmbeddingGemma 2 int8 0.84, keyword 0.76, MiniLM 0.61. EmbeddingGemma 2: 9.8 ms per query, ~490 MB resident while indexing, ~1.1 GB peak on a 2k-token chunk.
+
+#### The on-device model (EmbeddingGemma 2)
+
+Google's [EmbeddingGemma 2](https://huggingface.co/google/embeddinggemma-2) (Apache-2.0), quantized by us to int8 matmuls + a 4-bit token table (cosine ≥ 0.993 against the fp32 model), run with onnxruntime and sentencepiece only. Documents are embedded as `title: none | text: …`, queries as `task: search result | query: …`, one at a time, capped at 2048 tokens, as normalised 768-d vectors (`embeddinggemma-2-int8-768`; collection `context-embeddinggemma-2-int8-768`).
+
+The weights are not in the package. On first use the MCP server downloads them in the background from the release [`models-eg2-int8-v1`](https://github.com/contorch/context-orchestrator/releases/tag/models-eg2-int8-v1) (`contorch-memory model download` does it in the foreground), into `~/.context-orchestrator/models/models-eg2-int8-v1/` — `$CO_MODELS_DIR` overrides the parent folder (Contorch.app: its Application Support). Each file goes to `<file>.part`, resumes with an HTTP Range request after an interruption, is checked against the size and SHA-256 pinned in `local_model.py`, and only then renamed into place; `verified.json` marks the set complete. Until then search uses MiniLM (`local`) or full-text (`eg2`). Once verified, the server re-embeds sources, insights and every transcript into the new collection in the background and then switches; other processes pick it up on their next start. `CO_MODEL_DOWNLOAD=off` stops background downloads; `CO_MODEL_BASE_URL` points at a mirror (hashes are still checked). LICENSE and NOTICE are copied next to the weights.
+
+Publishing the files (maintainers): `scripts/publish-eg2-model.sh DIR` checks `DIR` against the pinned hashes and prints the `gh release create` command; the quantization recipe is in `src/context_orchestrator/model_licenses/embeddinggemma-2/NOTICE`.
 
 ### Transcripts
 
@@ -174,7 +187,8 @@ Manual transcript capture utility. Stores the current clipboard as a transcript 
 
 - `~/.context-orchestrator/context.db` — SQLite (tasks, sources, repo knowledge, transcripts)
 - `~/.context-orchestrator/env` — optional `KEY=VALUE` settings read by every entry point (environment wins)
-- `~/.context-orchestrator/chroma/` — ChromaDB vector index, served by the chroma daemon (uses the default `all-MiniLM-L6-v2` embeddings; no API key required)
+- `~/.context-orchestrator/chroma/` — ChromaDB vector index (one collection per embedding model)
+- `~/.context-orchestrator/models/` — the downloaded on-device model (`$CO_MODELS_DIR`)
 - `~/.context-orchestrator/chroma-daemon.log` — chroma server stdout / stderr
 - `~/.context-orchestrator/watcher_state.json` — transcript-watcher mtime cache
 - `~/.context-orchestrator/chroma.backup-<timestamp>/` — one-time backup created by `setup.sh` before first switching an existing install to the HTTP server
@@ -237,6 +251,8 @@ Claude reads the relevant files via the returned references and answers.
 .venv/bin/pip install -e '.[dev]'
 .venv/bin/pytest
 ```
+
+With the model files (`gh release download models-eg2-int8-v1 -D DIR`), `CO_TEST_EG2_RELEASE_DIR=DIR` adds tokenizer parity, embedding fidelity and a synthetic retrieval check (`CO_TEST_EG2_TOKENIZER=…/tokenizer.model` alone runs the parity test). `tests/test_local_model_bench.py` (`-m slow`, `CO_TEST_EG2_BENCH=DIR`) indexes a private benchmark corpus in place and checks MRR ≥ 0.80 — local only; no corpus text is in this repository.
 
 ## Architecture notes
 

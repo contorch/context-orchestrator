@@ -14,21 +14,15 @@ DEFAULT_CHROMA_PATH = Path.home() / ".context-orchestrator" / "chroma"
 DEFAULT_CHROMA_HOST = "127.0.0.1"
 DEFAULT_CHROMA_PORT = 8765
 
-# Optional embedding-model override. When unset, Chroma's default
-# all-MiniLM-L6-v2 is used (384d, 256-token cap, no extra deps).
-#
-# Two upgrade paths:
-#   1) Local sentence-transformers (e.g. nomic — 768d, 8k context):
-#        pip install -e '.[embeddings]'
-#        export CO_EMBEDDING_MODEL=nomic-ai/nomic-embed-text-v1.5
-#   2) Hosted Gemini (3072d, top-MTEB, asymmetric retrieval):
-#        pip install -e '.[embeddings-gemini]'
-#        export CO_EMBEDDING_MODEL=gemini-embedding-001
-#        # API key from GOOGLE_API_KEY/GEMINI_API_KEY env or
-#        # ~/.config/google/key (mode 600)
-#
-# Switching invalidates existing vectors — wipe the collection /
-# chroma path first so HNSW dimensions match.
+# The embedding model: CO_EMBEDDING_MODEL (embedding_choice, below) —
+#   gemini-embedding-001 (3072d, hosted; '.[embeddings-gemini]' + a key)
+#   local   EmbeddingGemma 2 on this Mac (local_model.py), MiniLM until its
+#           download is verified
+#   eg2     EmbeddingGemma 2 only; minilm  Chroma's all-MiniLM-L6-v2 (384d)
+#   none    full-text search only
+#   any other name: a sentence-transformers model ('.[embeddings]')
+# Each model has its own collection (VectorSearch._collection_name), so
+# switching never mixes vector spaces.
 EMBEDDING_MODEL_ENV = "CO_EMBEDDING_MODEL"
 GEMINI_KEY_FILE = Path.home() / ".config" / "google" / "key"
 
@@ -81,14 +75,24 @@ def _resolve_gemini_api_key() -> Optional[str]:
     return None
 
 
+LOCAL_EG2 = "embeddinggemma-2"
+MINILM = "minilm"
+_EG2_ALIASES = ("eg2", "embeddinggemma-2", "embeddinggemma", "local-gemma", "embeddinggemma-2-int8-768")
+_MINILM_ALIASES = ("minilm", "all-minilm")   # "all-MiniLM-L6-v2" stays a sentence-transformers name
+
+
 def embedding_choice() -> str:
     """The configured embedding model, normalised:
       "none"                 → no embeddings; search is full-text (FTS5) only
-      "local"                → Chroma's built-in all-MiniLM-L6-v2 (offline, 384d)
+      "local"                → the best on-device model: EmbeddingGemma 2 once its
+                               files are downloaded and verified, MiniLM until then
+      "embeddinggemma-2"     → EmbeddingGemma 2 only ("eg2", "local-gemma"); full-text
+                               search until the model is verified
+      "minilm"               → Chroma's built-in all-MiniLM-L6-v2 (offline, 384d)
       "gemini-embedding-001" → Gemini (needs a key; "gemini" is an alias)
       any other name         → a sentence-transformers model
       ""                     → unset: Gemini if a key + google-genai exist, else local
-    Set with `contorch-memory embeddings gemini|local|none`
+    Set with `contorch-memory embeddings gemini|local|eg2|minilm|none`
     (~/.context-orchestrator/env)."""
     v = (os.environ.get(EMBEDDING_MODEL_ENV) or "").strip()
     low = v.lower()
@@ -96,53 +100,91 @@ def embedding_choice() -> str:
         return "none"
     if low in ("off", "default", "local"):   # "off" meant "not Gemini" before 0.4
         return "local"
+    if low in _EG2_ALIASES:
+        return LOCAL_EG2
+    if low in _MINILM_ALIASES:
+        return MINILM
     if low == "gemini":
         return "gemini-embedding-001"
     return v
 
 
+def _gemini_available() -> bool:
+    """A key and google-genai, without importing it."""
+    from importlib.util import find_spec
+    try:
+        return bool(find_spec("google") and find_spec("google.genai") and _resolve_gemini_api_key())
+    except (ImportError, ValueError):
+        return False
+
+
+def wants_local_model(choice: Optional[str] = None) -> bool:
+    """Does this choice use EmbeddingGemma 2 (now or once downloaded)?"""
+    choice = embedding_choice() if choice is None else choice
+    return choice in ("local", LOCAL_EG2) or (choice == "" and not _gemini_available())
+
+
+def resolve_backend(choice: Optional[str] = None) -> str:
+    """What search embeds with right now, from the choice and what is on disk:
+      "none"        full-text only (choice none)
+      "eg2-pending" full-text only until EmbeddingGemma 2 is verified (choice eg2)
+      "eg2"         EmbeddingGemma 2
+      "minilm"      all-MiniLM-L6-v2 (choice minilm, or local before EG2 is verified)
+      "gemini-…"    that Gemini model
+      other         a sentence-transformers model name
+    Cheap (env + file stats): memstatus uses it too."""
+    from . import local_model
+    choice = embedding_choice() if choice is None else choice
+    if choice == "none":
+        return "none"
+    if choice == "" and _gemini_available():
+        return "gemini-embedding-001"
+    if choice in ("", "local"):
+        return "eg2" if local_model.is_ready() else MINILM
+    if choice == LOCAL_EG2:
+        return "eg2" if local_model.is_ready() else "eg2-pending"
+    if choice == MINILM:
+        return MINILM
+    return choice
+
+
+def backend_identity(backend: str) -> str:
+    """The identity (ef.name()) a backend's vectors carry — without building it."""
+    from . import local_model
+    if backend in ("none", "eg2-pending"):
+        return "none"
+    if backend == MINILM:
+        return "default"
+    if backend == "eg2":
+        return local_model.MODEL_NAME
+    if backend.startswith("gemini-"):
+        return f"gemini-{backend}"
+    return "sentence_transformer"
+
+
 def _build_embedding_function():
-    """Construct a Chroma EmbeddingFunction for the user-configured model.
+    """Construct a Chroma EmbeddingFunction for the configured model
+    (resolve_backend): None = Chroma's built-in MiniLM.
 
-    Resolution order:
-      1. CO_EMBEDDING_MODEL set to a model name → use it.
-      2. CO_EMBEDDING_MODEL set to "off" / "none" / "default" → force the
-         local Chroma default (returns None).
-      3. CO_EMBEDDING_MODEL unset → AUTO-DETECT: if a Gemini API key is
-         resolvable AND google-genai is importable, default to
-         gemini-embedding-001. Otherwise fall back to local default.
-
-    The auto-detect is what lets the watcher (with explicit env in its
-    plist) and the MCP server (which inherits whatever the spawning client
-    happens to pass) converge to the same EF without manual sync — as
-    long as the key file is present, both will pick Gemini. Setting
-    CO_EMBEDDING_MODEL=off explicitly opts out.
+    Unset CO_EMBEDDING_MODEL auto-detects: Gemini when a key is resolvable
+    AND google-genai is importable, otherwise "local" — EmbeddingGemma 2 once
+    its files are verified (the MCP server downloads them in the background),
+    MiniLM until then. The auto-detect is what lets every entry point converge
+    to the same EF without manual sync. Callers check resolve_backend() for
+    "none"/"eg2-pending" (no vector index) before calling this.
     """
-    model_name = embedding_choice()
-    if model_name == "none":
-        raise RuntimeError("embeddings are turned off (CO_EMBEDDING_MODEL=none)")
-    if model_name == "local":
-        logger.info(f"{EMBEDDING_MODEL_ENV}=local: chroma default (all-MiniLM-L6-v2, 384d)")
+    backend = resolve_backend()
+    if backend in ("none", "eg2-pending"):
+        raise RuntimeError(f"no embedding function for {backend!r} (full-text search only)")
+    if backend == MINILM:
+        logger.info(f"{EMBEDDING_MODEL_ENV}={embedding_choice() or 'unset'}: "
+                    "chroma default (all-MiniLM-L6-v2, 384d)")
         return None
-    if not model_name:
-        # Auto-detect Gemini availability
-        try:
-            import google.genai  # noqa: F401
-            if _resolve_gemini_api_key():
-                model_name = "gemini-embedding-001"
-                logger.info(
-                    f"{EMBEDDING_MODEL_ENV} unset; auto-detected Gemini "
-                    f"(key present + google-genai installed) → {model_name}. "
-                    f"Set {EMBEDDING_MODEL_ENV}=off to force local default."
-                )
-        except ImportError:
-            pass
-    if not model_name:
-        logger.info(
-            f"{EMBEDDING_MODEL_ENV} unset and Gemini unavailable; "
-            "using chroma default (local 384d)"
-        )
-        return None
+    if backend == "eg2":
+        from .local_model import EmbeddingGemmaEF, MODEL_NAME
+        logger.info(f"{EMBEDDING_MODEL_ENV}={embedding_choice() or 'unset'}: {MODEL_NAME} on this Mac")
+        return EmbeddingGemmaEF()
+    model_name = backend
     if model_name.startswith("gemini-"):
         return _build_gemini_embedding_function(model_name)
     try:
@@ -520,11 +562,17 @@ class VectorSearch:
         self._session_wrote = False
         # CO_EMBEDDING_MODEL=none: no vector index at all. Every method is a
         # no-op / empty; search runs on SQLite full-text search instead.
-        self.enabled = embedding_choice() != "none"
+        self.backend = resolve_backend()
+        # Explicit EmbeddingGemma 2 whose files aren't verified yet: full-text
+        # search until they are (the MCP server downloads and switches).
+        self.waiting_for_model = self.backend == "eg2-pending"
+        self.enabled = self.backend not in ("none", "eg2-pending")
         if not self.enabled:
             self.identity = "none"
             self._ef = None
-            logger.info("Vector search off (CO_EMBEDDING_MODEL=none) — full-text search only")
+            logger.info("Vector search off (%s) — full-text search only",
+                        "waiting for the on-device model" if self.waiting_for_model
+                        else "CO_EMBEDDING_MODEL=none")
             return
         self._ef = _build_embedding_function()
         self.identity = ef_identity(self._ef)

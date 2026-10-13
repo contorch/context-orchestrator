@@ -735,7 +735,12 @@ def _cmd_rm(args) -> int:
 
 
 def _cmd_reindex(args) -> int:
+    from . import local_model, search
     db, vs = _open_db(), _open_vs()
+    if search.wants_local_model() and not local_model.is_ready():
+        print("EmbeddingGemma 2 isn't downloaded yet — indexing with "
+              + ("nothing (keyword search)" if vs.waiting_for_model else vs.identity)
+              + "; `contorch-memory model download`, then reindex again.", file=sys.stderr)
     if args.meeting_id:
         row = db.get_transcript(args.meeting_id)
         if not row:

@@ -1,0 +1,35 @@
+EmbeddingGemma 2 — int8 ONNX build redistributed by Contorch
+=============================================================
+
+The model files published as the GitHub release `models-eg2-int8-v1` of
+https://github.com/contorch/context-orchestrator
+
+    eg2-mixed.onnx        (graph)
+    eg2-mixed.onnx_data   (weights)
+    tokenizer.model       (sentencepiece tokenizer, unmodified)
+
+are a Derivative Work of EmbeddingGemma 2 by Google DeepMind, licensed under
+the Apache License, Version 2.0 (see LICENSE in this folder).
+
+  Original model:   https://huggingface.co/google/embeddinggemma-2
+                    (revision 914f7f89142e33e77833254d9c9b90c3cef7303b)
+  ONNX export used: https://huggingface.co/onnx-community/embeddinggemma-2-ONNX
+                    (revision daa72c51243991dfcaf9f9137d2c573d8f7790c0,
+                    onnx/model.onnx — the fp32 text model)
+
+Modifications made by Contorch (2026-10-12):
+  * Weight-only quantization with onnxruntime's MatMulNBitsQuantizer
+    (block size 32, symmetric, accuracy_level 4):
+      - the token-embedding Gather -> 4-bit (GatherBlockQuantized), axis 1
+      - every MatMul -> 8-bit MatMulNBits, axis 0
+  * Saved with all tensors in one external data file, eg2-mixed.onnx_data.
+  * No other change to the graph, the tokenizer or the vocabulary.
+
+Measured against the original fp32 model on 221 texts: cosine similarity of
+the 768-d embeddings 0.993 minimum / 0.999 mean.
+
+"Gemma" and "EmbeddingGemma" are trademarks of Google LLC. This build is
+not made, endorsed or supported by Google.
+
+Copyright 2026 Google LLC (original model)
+Modifications copyright 2026 Contorch

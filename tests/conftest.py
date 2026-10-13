@@ -19,6 +19,12 @@ os.environ.pop("CLAUDE_CONFIG_DIR", None)
 # launchd labels are per user, not per HOME: a test that reached launchctl
 # would replace the developer's real agents. Every call refuses instead.
 os.environ["CO_NO_LAUNCHCTL"] = "1"
+# The on-device model (EmbeddingGemma 2, ~243 MB): never downloaded in the
+# background by a test, and looked for only in the scratch HOME. Tests that
+# need the real files point CO_MODELS_DIR at them (see test_local_model.py).
+os.environ["CO_MODEL_DOWNLOAD"] = "off"
+os.environ.pop("CO_MODELS_DIR", None)
+os.environ.pop("CO_MODEL_BASE_URL", None)
 
 # Set before any context_orchestrator import. Each test that needs isolation
 # overrides server.vs / server.db with its own tmp_path-scoped instance, so
