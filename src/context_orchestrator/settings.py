@@ -2,7 +2,8 @@
 
     contorch-memory status
     contorch-memory embeddings                  # show the current choice
-    contorch-memory embeddings gemini|local|none
+    contorch-memory embeddings gemini|local|eg2|minilm|none
+    contorch-memory model status|download [--json]
     contorch-memory claude install|uninstall|status [--channel app|brew|dev] [--json]
     contorch-memory status --json [--deep] | selftest --json | where --json
     contorch-memory backup --to DIR [--stop-server] --json | restore --from DIR --json
@@ -12,16 +13,29 @@ The embedding choice decides how search understands a question:
   gemini — Google's gemini-embedding-001: best at paraphrases; needs a key
            (~/.config/google/key) and network for every search and every new
            transcript.
-  local  — all-MiniLM-L6-v2 running on this Mac: no key, no network; ~80 MB
-           model downloaded once; weaker than Gemini on paraphrases.
+  local  — the best model that runs on this Mac: EmbeddingGemma 2 (no key, no
+           network after a one-time ~243 MB download; close to Gemini, also
+           matches across languages). Until the download is verified, local
+           search uses all-MiniLM-L6-v2.
+  eg2    — EmbeddingGemma 2 only (alias embeddinggemma-2, local-gemma):
+           keyword search until the model is downloaded and verified.
+  minilm — all-MiniLM-L6-v2 on this Mac (~80 MB; weaker on paraphrases,
+           English only).
   none   — no embeddings: keyword search (SQLite full-text, stemmed) only.
-Full-text search is always on, whatever the choice.
+Full-text search is always on, whatever the choice. Unset = gemini when a key
+exists, otherwise local.
 
 The choice is written to ~/.context-orchestrator/env, which every entry point
 reads (MCP server, CLIs). Each model has its own vector collection; switching
 re-embeds transcripts from the stored text on the next search (or
 `contorch-transcripts reindex`), and switching back reuses the old vectors.
 Machines that share embedding bundles must use the same choice.
+
+The EmbeddingGemma 2 files are fetched by the MCP server in the background on
+first use (or now: `contorch-memory model download`), into
+~/.context-orchestrator/models/ ($CO_MODELS_DIR overrides; CO_MODEL_DOWNLOAD=off
+stops background downloads). When they are verified, the server re-embeds
+everything with it in the background and then switches.
 """
 from __future__ import annotations
 
@@ -32,9 +46,12 @@ import sys
 from pathlib import Path
 
 from . import ENV_FILE
-from .search import EMBEDDING_MODEL_ENV, _resolve_gemini_api_key, embedding_choice
+from .search import (EMBEDDING_MODEL_ENV, LOCAL_EG2, MINILM, _gemini_available,
+                     _resolve_gemini_api_key, embedding_choice, resolve_backend)
 
-CHOICES = {"gemini": "gemini-embedding-001", "local": "local", "none": "none"}
+CHOICES = {"gemini": "gemini-embedding-001", "local": "local", "eg2": "embeddinggemma-2",
+           "embeddinggemma-2": "embeddinggemma-2", "local-gemma": "embeddinggemma-2",
+           "minilm": "minilm", "none": "none"}
 
 
 def set_env_value(key: str, value: str, path: Path = ENV_FILE) -> None:
@@ -75,17 +92,38 @@ def set_env_value(key: str, value: str, path: Path = ENV_FILE) -> None:
             fcntl.flock(lock, fcntl.LOCK_UN)
 
 
+def _model_note() -> str:
+    from . import local_model
+    st = local_model.state()
+    if st["state"] == "verified":
+        return "ready"
+    if st["state"] == "downloading":
+        return f"downloading, {st['percent']}%"
+    if st["state"] == "partial":
+        return f"download interrupted at {st['percent']}%, resumes on next use"
+    if st["state"] == "failed":
+        return f"download failed: {st['error']}"
+    return "not downloaded yet: ~243 MB, fetched on first use"
+
+
 def describe(choice: str) -> str:
     if choice == "none":
         return "none — keyword (full-text) search only"
     if choice == "local":
-        return "local — all-MiniLM-L6-v2 on this Mac (no key, no network)"
+        backend = resolve_backend(choice)
+        now = "EmbeddingGemma 2" if backend == "eg2" else "all-MiniLM-L6-v2 until EmbeddingGemma 2 is ready"
+        return f"local — on this Mac, no key, no network: {now} (EmbeddingGemma 2 {_model_note()})"
+    if choice == LOCAL_EG2:
+        tail = "" if resolve_backend(choice) == "eg2" else "; keyword search until then"
+        return f"embeddinggemma-2 — EmbeddingGemma 2 on this Mac ({_model_note()}{tail})"
+    if choice == MINILM:
+        return "minilm — all-MiniLM-L6-v2 on this Mac (no key, no network)"
     if choice.startswith("gemini"):
         key = "key found" if _resolve_gemini_api_key() else "NO KEY — add one to ~/.config/google/key"
         return f"gemini — {choice} ({key})"
     if not choice:
-        return ("auto — Gemini when a key is present, otherwise local "
-                f"(currently {'Gemini' if _resolve_gemini_api_key() else 'local'})")
+        now = "Gemini" if _gemini_available() else describe("local").split(" — ", 1)[1]
+        return f"auto — Gemini when a key is present, otherwise local (currently {now})"
     return f"{choice} (sentence-transformers)"
 
 
@@ -97,7 +135,10 @@ def set_embeddings(name: str, env_file: Path = ENV_FILE) -> str:
     msg = [f"embeddings: {describe(embedding_choice())}"]
     if name == "gemini" and not _resolve_gemini_api_key():
         msg.append("  Search stays keyword-only until a Gemini key is in ~/.config/google/key.")
-    if name == "local":
+    if CHOICES[name] in ("local", LOCAL_EG2) and resolve_backend() != "eg2":
+        msg.append("  EmbeddingGemma 2 (~243 MB) downloads in the background on the next search "
+                   "(or now: contorch-memory model download).")
+    if name == "minilm":
         msg.append("  The model (~80 MB) downloads on first use.")
     if name != "none":
         msg.append("  Transcripts are re-embedded from the stored text on the next search "
@@ -105,6 +146,44 @@ def set_embeddings(name: str, env_file: Path = ENV_FILE) -> str:
     else:
         msg.append("  Restart Claude Code to apply. Existing vectors are kept for switching back.")
     return "\n".join(msg)
+
+
+MODEL_SCHEMA = "contorch-memory.model/1"
+
+
+def _cmd_model(args) -> int:
+    """`model status` — the EmbeddingGemma 2 files; `model download` — fetch +
+    verify now (progress on stderr; --json: one document on stdout)."""
+    from . import local_model
+
+    def build():
+        if args.action == "download":
+            last = [-1.0]
+
+            def progress(p):
+                if p["percent"] - last[0] >= 5 or p["state"] == "verified":
+                    last[0] = p["percent"]
+                    print(f"model: {p['state']} {p['percent']}%", file=sys.stderr, flush=True)
+            try:
+                local_model.download(progress=progress)
+            except local_model.DownloadError as exc:
+                from .jsonout import error
+                return {"schema": MODEL_SCHEMA, "ok": False, "action": "download",
+                        "model": local_model.state(), "error": error("download_failed", str(exc))}
+        st = local_model.state()
+        return {"schema": MODEL_SCHEMA, "ok": args.action == "status" or st["state"] == "verified",
+                "action": args.action, "model": st}
+
+    def desc(doc):
+        st = doc["model"]
+        line = f"{st['model']}: {st['state']} ({st['bytes_done']} of {st['bytes_total']} bytes) in {st['dir']}"
+        return line + (f"\n  {doc['error']['message']}" if doc.get("error") else "")
+    if args.json:
+        doc = _emit_json(build, MODEL_SCHEMA, args.action, desc)
+    else:
+        doc = build()
+        print(desc(doc))
+    return 0 if doc.get("ok") else 1
 
 
 def _cmd_claude(args) -> int:
@@ -190,8 +269,11 @@ def _cmd_data(args) -> int:
 def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(prog="contorch-memory", description=__doc__.split("\n\n")[0])
     sub = p.add_subparsers(dest="cmd", required=True)
-    e = sub.add_parser("embeddings", help="show or set the embedding model: gemini, local, none")
+    e = sub.add_parser("embeddings", help="show or set the embedding model: gemini, local, eg2, minilm, none")
     e.add_argument("choice", nargs="?", choices=list(CHOICES))
+    mo = sub.add_parser("model", help="the on-device EmbeddingGemma 2 files: status, download")
+    mo.add_argument("action", choices=("status", "download"))
+    mo.add_argument("--json", action="store_true")
     st = sub.add_parser("status", help="embedding choice, transcripts stored, pending, index size")
     st.add_argument("--json", action="store_true", help="contorch-memory.status/1 on stdout (no chromadb import)")
     st.add_argument("--deep", action="store_true", help="--json: also open the index with chromadb and count")
@@ -225,6 +307,8 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.cmd == "claude":
         return _cmd_claude(args)
+    if args.cmd == "model":
+        return _cmd_model(args)
     if args.cmd in ("selftest", "where", "backup", "restore", "index") or (
             args.cmd == "status" and (args.json or args.deep)):
         return _cmd_data(args)

@@ -42,6 +42,50 @@ jobs:
           contorch-memory backup --to "$RUNNER_TEMP/b" --json | jq -e .ok
           contorch-memory where --json | jq -e '.mcp | endswith("/contorch-mcp")'
 
+  eg2-model:
+    # The on-device model (EmbeddingGemma 2). Tokenizer parity always runs
+    # (tokenizer.model from Hugging Face at the pinned revision). The real
+    # model tests (fidelity, retrieval) and a real download from the GitHub
+    # release run once the release `models-eg2-int8-v1` is published; until
+    # then they are skipped with a notice. No benchmark corpus in CI — the
+    # real-corpus check (tests/test_local_model_bench.py) is local only.
+    runs-on: macos-15
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
+      - name: model files
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          d="$RUNNER_TEMP/eg2"; mkdir -p "$d"
+          curl -fsSL "https://huggingface.co/google/embeddinggemma-2/resolve/914f7f89142e33e77833254d9c9b90c3cef7303b/tokenizer.model" -o "$d/tokenizer.model"
+          echo "e594c8a90eb08d8bda498ff4747977dc827ae0c3c56b5c0d41a605a22d02ef03  $d/tokenizer.model" | shasum -a 256 -c -
+          echo "CO_TEST_EG2_TOKENIZER=$d/tokenizer.model" >> "$GITHUB_ENV"
+          if gh release view models-eg2-int8-v1 --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release download models-eg2-int8-v1 --repo "$GITHUB_REPOSITORY" -D "$d" --clobber -p 'eg2-mixed.onnx*'
+            echo "CO_TEST_EG2_RELEASE_DIR=$d" >> "$GITHUB_ENV"
+            echo "EG2_RELEASE=1" >> "$GITHUB_ENV"
+          else
+            echo "::notice::release models-eg2-int8-v1 is not published yet: real-model tests skipped"
+          fi
+      - name: pytest tests/test_local_model.py
+        run: |
+          python -m pip install -q -e '.[dev]'
+          python -m pytest -q -rs tests/test_local_model.py
+      - name: real download from the release in a scratch HOME (contorch-memory model download)
+        if: env.EG2_RELEASE == '1'
+        run: |
+          set -euo pipefail
+          export HOME="$RUNNER_TEMP/eg2-home" CO_EMBEDDING_MODEL=local
+          mkdir -p "$HOME"
+          contorch-memory model download --json | jq -e '.ok and .model.state == "verified"'
+          contorch-memory status --json | jq -e '.embedding_identity == "embeddinggemma-2-int8-768" and .local_model.state == "verified"'
+          echo "[10:00:01] Jane: the zebra migration ships Thursday" | contorch-transcripts add - --title "Zebra sync"
+          contorch-memory selftest --json | jq -e '.ok and .stage == "done"'
+
   slow:
     # Multi-process in-process-Chroma stress (writers + long-lived MCP servers
     # + hooks on one folder). Must print vectorless=0 resurrected=0. Any
@@ -72,7 +116,7 @@ jobs:
         run: |
           set -euo pipefail
           /bin/bash --version | head -1
-          for f in bootstrap.sh setup.sh install-claude-context.sh scripts/contorch_channel_guard.sh tests/bootstrap_guard_test.sh tests/test_no_claude_edit_in_bash.sh tests/test_no_recorder_plist_writes.sh; do /bin/bash -n "$f"; done
+          for f in bootstrap.sh setup.sh install-claude-context.sh scripts/contorch_channel_guard.sh scripts/publish-eg2-model.sh tests/bootstrap_guard_test.sh tests/test_no_claude_edit_in_bash.sh tests/test_no_recorder_plist_writes.sh; do /bin/bash -n "$f"; done
           ! grep -nE 'mapfile|readarray|declare -A|\$\{[a-zA-Z_]+(,,|\^\^)|&>>|\[\[ -v|read -i|coproc' bootstrap.sh setup.sh install-claude-context.sh scripts/contorch_channel_guard.sh tests/bootstrap_guard_test.sh tests/test_no_claude_edit_in_bash.sh tests/test_no_recorder_plist_writes.sh
           # "$name…" — bash 3.2 in a UTF-8 locale reads the ellipsis as part of the name
           ! grep -nP '\$[A-Za-z_][A-Za-z0-9_]*[^\x00-\x7F]' bootstrap.sh setup.sh install-claude-context.sh scripts/contorch_channel_guard.sh tests/bootstrap_guard_test.sh tests/test_no_claude_edit_in_bash.sh tests/test_no_recorder_plist_writes.sh

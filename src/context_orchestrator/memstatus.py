@@ -15,7 +15,6 @@ import re
 import sqlite3
 import sys
 import urllib.request
-from importlib.util import find_spec
 from pathlib import Path
 from typing import Optional
 
@@ -41,19 +40,10 @@ def index_compatible(written_by: Optional[str], installed: Optional[str]) -> boo
 
 
 def effective_identity(choice: str) -> str:
-    """The embedding identity search would use, without building the model."""
-    from .search import _resolve_gemini_api_key
-    if choice == "none":
-        return "none"
-    if choice == "local":
-        return "default"
-    if choice.startswith("gemini-"):
-        return f"gemini-{choice}"
-    if not choice:
-        if find_spec("google") and find_spec("google.genai") and _resolve_gemini_api_key():
-            return "gemini-gemini-embedding-001"
-        return "default"
-    return "sentence_transformer"
+    """The embedding identity search would use now, without building the model
+    ("none" while an explicitly chosen EmbeddingGemma 2 is still downloading)."""
+    from .search import backend_identity, resolve_backend
+    return backend_identity(resolve_backend(choice))
 
 
 def _collection_name(chroma_path: Path, identity: str) -> Optional[str]:
@@ -133,6 +123,11 @@ def status(deep: bool = False) -> dict:
         doc["db_path"] = str(db.db_path)
     except Exception as exc:
         errors.append({"code": "db_unreadable", "message": f"{type(exc).__name__}: {exc}"[:300]})
+    if search.wants_local_model(choice):
+        # EmbeddingGemma 2: download progress, and what search uses meanwhile.
+        from . import local_model
+        doc["local_model"] = local_model.state()
+        doc["embedding_target"] = local_model.MODEL_NAME
     if vector_index != "none":
         name = _collection_name(index_dir, identity)
         doc["collection"] = name
@@ -188,6 +183,11 @@ def describe(doc: dict) -> str:
              f"chromadb:     {doc.get('chromadb_version')} (index written by "
              f"{doc.get('index_written_by') or 'unknown'}; "
              f"{'compatible' if doc.get('index_compatible') else 'NOT compatible'})"]
+    lm = doc.get("local_model")
+    if lm:
+        lines.append(f"local model:  {lm['model']} {lm['state']}"
+                     + (f" ({lm['percent']}%)" if lm["state"] in ("downloading", "partial") else "")
+                     + (f" — {lm['error']}" if lm.get("error") else ""))
     if doc.get("error"):
         lines.append(f"error:        {doc['error']['code']}: {doc['error']['message']}")
     return "\n".join(lines)

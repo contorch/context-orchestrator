@@ -1,0 +1,118 @@
+{
+ "_comment": "Synthetic texts only (written for these tests; no transcript text). Used by test_local_model.py. literal_specials: Hugging Face's tokenizer turns the text '<bos>' into the special token; sentencepiece (what we ship) keeps it as text, which is what a transcript that says '<bos>' means.",
+ "tokenizer": [
+  "hello world",
+  "",
+  " ",
+  "  leading and trailing spaces  ",
+  "Tabs\tand\nnewlines\n\nand  double  spaces",
+  "The zebra migration ships on Thursday, says Jane.",
+  "[10:00:01] Alex: can we move the pricing review to 3pm?",
+  "Q3 OKRs: revenue +12%, churn < 2.5%, NPS ≥ 45",
+  "नमस्ते दुनिया, आज की बैठक में बजट पर चर्चा हुई।",
+  "क्या हम अगले हफ़्ते लॉन्च कर सकते हैं?",
+  "日本語のテキストも少し入れておきます。",
+  "Ünïcödé àccents — em dash, “smart quotes”, ellipsis…",
+  "emoji 🚀🔥👍 and a flag 🇮🇳",
+  "def add(a, b):\n    return a + b  # simple",
+  "SELECT meeting_id FROM transcripts WHERE started_at > '2026-01-01';",
+  "https://github.com/contorch/context-orchestrator/pull/31?tab=files#diff",
+  "user@example.com sent 1,234.56 USD on 2026-10-12T10:00:00Z",
+  "ALLCAPS SHOUTING and camelCaseIdentifiers and snake_case_names",
+  "a",
+  "1234567890",
+  "....,,,,;;;;!!!!????",
+  "kubectl rollout restart deployment/api-gateway -n prod",
+  "The quick brown fox jumps over the lazy dog. ",
+  "title: none | text: the prompt prefix itself",
+  "task: search result | query: when does the migration ship?"
+ ],
+ "corpus": [
+  {
+   "id": "d0",
+   "text": "Jane said the zebra database migration is scheduled to ship on Thursday after the load test passes."
+  },
+  {
+   "id": "d1",
+   "text": "We agreed to raise the price of the team plan from 8 to 10 dollars per seat starting in January."
+  },
+  {
+   "id": "d2",
+   "text": "The office coffee machine is broken again; facilities will replace it next week."
+  },
+  {
+   "id": "d3",
+   "text": "Ravi will hire two backend engineers and one designer before the end of the quarter."
+  },
+  {
+   "id": "d4",
+   "text": "Customer churn rose to four percent in September, mostly small accounts leaving after the trial."
+  },
+  {
+   "id": "d5",
+   "text": "The mobile app crashes on launch for Android 12 users; a hotfix build goes out tonight."
+  },
+  {
+   "id": "d6",
+   "text": "Marketing wants a webinar about security compliance, SOC 2 and data residency in the EU."
+  },
+  {
+   "id": "d7",
+   "text": "The offsite will be in Lisbon in May; everyone should book flights by the end of March."
+  },
+  {
+   "id": "d8",
+   "text": "अगले महीने से हम ग्राहकों को साप्ताहिक रिपोर्ट ईमेल से भेजेंगे।"
+  },
+  {
+   "id": "d9",
+   "text": "Legal flagged the new contract template: the liability cap must be twelve months of fees."
+  }
+ ],
+ "queries": [
+  {
+   "query": "when does the schema change go live?",
+   "relevant": "d0"
+  },
+  {
+   "query": "how much more will a seat cost",
+   "relevant": "d1"
+  },
+  {
+   "query": "who is recruiting engineers",
+   "relevant": "d3"
+  },
+  {
+   "query": "why are customers cancelling",
+   "relevant": "d4"
+  },
+  {
+   "query": "phone application failing to start",
+   "relevant": "d5"
+  },
+  {
+   "query": "where is the company retreat",
+   "relevant": "d7"
+  },
+  {
+   "query": "weekly report emails to customers",
+   "relevant": "d8"
+  },
+  {
+   "query": "limit on liability in agreements",
+   "relevant": "d9"
+  },
+  {
+   "query": "espresso maker repair",
+   "relevant": "d2"
+  },
+  {
+   "query": "online event on compliance",
+   "relevant": "d6"
+  }
+ ],
+ "literal_specials": [
+  "<bos> literal special-looking tokens <eos> <pad>",
+  "a <start_of_turn> marker"
+ ]
+}

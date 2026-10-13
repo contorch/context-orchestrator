@@ -6,6 +6,8 @@ from contextlib import asynccontextmanager
 from datetime import date, datetime
 from pathlib import Path
 
+import threading
+
 import anyio
 from mcp.server.fastmcp import FastMCP
 from context_orchestrator.db import Database
@@ -14,6 +16,8 @@ from context_orchestrator.search import VectorSearch
 from context_orchestrator.ingest import index_file_content
 from context_orchestrator.watcher import catch_up as _catch_up_transcripts
 from context_orchestrator import transcripts as _transcripts
+from context_orchestrator import local_model as _local_model
+from context_orchestrator import search as _search
 
 # How long after a meeting transcript was last touched do we still auto-link new sources to it?
 RECENT_MEETING_WINDOW_SECONDS = 10 * 60
@@ -49,8 +53,9 @@ chroma_path = os.environ.get("CO_CHROMA_PATH")
 vs = VectorSearch(chroma_path=Path(chroma_path) if chroma_path else None)
 
 
-def _sync_index():
-    """Ensure all existing data is indexed. Runs in background on startup.
+def _sync_index(target: "VectorSearch | None" = None):
+    """Ensure all existing data is indexed into `target` (default: the open
+    index). Runs in background on startup and when the model switches.
 
     Fast-path: if chroma already has at least one entry for every
     repo_knowledge id and every source id, skip the whole sync. This
@@ -58,6 +63,7 @@ def _sync_index():
     eliminates the timing race where the background sync thread is mid-
     Gemini-call when an MCP tool request lands and the stdio pipe drops.
     """
+    vs = target if target is not None else globals()["vs"]
     if not vs.enabled:
         logger.info("Embeddings off — nothing to sync to a vector index (full-text search only)")
         return
@@ -139,6 +145,11 @@ def _index_new_transcripts(force: bool = False) -> None:
     if not force and now - _last_catch_up < CATCH_UP_EVERY_S:
         return
     _last_catch_up = now
+    _model_housekeeping()
+    if _switching():
+        # The switch thread is embedding everything with the new model;
+        # indexing here with the old one would mark rows back (indexed_with).
+        return
     try:
         indexed = _catch_up_transcripts(vs, db=db)
         if indexed:
@@ -146,6 +157,83 @@ def _index_new_transcripts(force: bool = False) -> None:
                         len(indexed), ", ".join(indexed))
     except Exception:
         logger.exception("transcript catch-up failed")
+
+
+# ---- the on-device model (EmbeddingGemma 2) ----------------------------------
+# "local" means EmbeddingGemma 2 once its files are downloaded and verified
+# (local_model.py), MiniLM until then; an explicit "embeddinggemma-2" choice
+# is full-text search until then. This server downloads the files in the
+# background on first use, then re-embeds everything into the new model's
+# collection in the background (transcripts.indexed_with tells what is left)
+# and only then swaps `vs`, so search never runs on a half-built index.
+SWITCH_RETRY_S = 10 * 60
+_switch_lock = threading.Lock()
+_switch_thread: "threading.Thread | None" = None
+_switch_failed_at: "float | None" = None
+
+
+def _switching() -> bool:
+    return _switch_thread is not None and _switch_thread.is_alive()
+
+
+def _model_housekeeping() -> None:
+    try:
+        if _search.wants_local_model() and not _local_model.is_ready():
+            _local_model.ensure_downloading(on_ready=_maybe_switch_model)
+        _maybe_switch_model()
+    except Exception:
+        logger.exception("on-device model check failed")
+
+
+def _maybe_switch_model() -> None:
+    """Start the background switch when the model search should use now
+    (choice + files on disk) isn't the one the open index was built with."""
+    global _switch_thread
+    # Only the download finishing changes the model under a running server
+    # (a new choice in the env file needs a restart, as before).
+    target = _search.backend_identity(_search.resolve_backend())
+    if target != _local_model.MODEL_NAME or target == getattr(vs, "identity", target) \
+            or (_switch_failed_at is not None
+                and time.monotonic() - _switch_failed_at < SWITCH_RETRY_S):
+        return
+    with _switch_lock:
+        if _switching():
+            return
+        _switch_thread = threading.Thread(target=_switch_model, name="model-switch", daemon=True)
+        _switch_thread.start()
+
+
+def _switch_model(poll_s: float = 2.0, max_idle_rounds: int = 30) -> bool:
+    """Build the new model's index (sources, notes, repo knowledge, every
+    settled transcript), then make it the one search uses. Another MCP server
+    may be doing the same: the transcript catch-up lock lets one index at a
+    time and the rest find the rows done (indexed_with)."""
+    global vs, _switch_failed_at
+    try:
+        new_vs = VectorSearch(chroma_path=Path(chroma_path) if chroma_path else None)
+        if new_vs.identity == vs.identity:
+            return False
+        logger.info("re-embedding with %s in the background (search stays on %s until done)",
+                    new_vs.identity, vs.identity)
+        _sync_index(new_vs)
+        idle = 0
+        while True:
+            done = _catch_up_transcripts(new_vs, db=db)
+            left = db.transcripts_to_index(time.time() - _transcripts.SETTLE_SECONDS, new_vs.identity)
+            if not left:
+                break
+            idle = 0 if done else idle + 1
+            if idle >= max_idle_rounds:
+                raise RuntimeError(f"{len(left)} transcript(s) could not be embedded with {new_vs.identity}")
+            time.sleep(poll_s)
+        old, vs = vs, new_vs
+        _sync_index(vs)          # anything added to the old index meanwhile
+        logger.info("search now uses %s (was %s)", vs.identity, old.identity)
+        return True
+    except Exception:
+        _switch_failed_at = time.monotonic()
+        logger.exception("switching the embedding model failed; retried in %d min", SWITCH_RETRY_S // 60)
+        return False
 
 
 def _startup_sync() -> None:
@@ -717,7 +805,12 @@ def search(
             )
         else:
             lines.append(f"  [{doc_type}] {h['text'][:200]}")
-    if not vs.enabled:
+    if getattr(vs, "waiting_for_model", False):
+        st = _local_model.state()
+        lines.append(f"  (keyword search — the on-device model is {st['state']}"
+                     + (f", {st['percent']}%" if st["state"] in ("downloading", "partial") else "")
+                     + "; semantic search starts once it is verified)")
+    elif not vs.enabled:
         lines.append("  (keyword search — embeddings are off; `contorch-memory embeddings` to change)")
     return "\n".join(lines)
 
