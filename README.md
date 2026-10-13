@@ -138,7 +138,7 @@ The vector index is served by a `chroma run` HTTP daemon (launchd-managed) liste
 
 Unset = `gemini` when a key exists, otherwise `local`. The choice is stored in `~/.context-orchestrator/env`; `contorch-memory status` shows it with counts. Each model gets its own Chroma collection and each transcript records which model embedded it (`indexed_with`), so switching re-embeds from the stored text (next search, or `contorch-transcripts reindex`) and switching back reuses the old vectors. Machines exchanging embedding bundles must use the same choice. The Contorch menu bar shows the mode on its Index line.
 
-Benchmark on 100 hand-written questions over this Mac's own meetings (chunk-level MRR@10): Gemini 0.89, EmbeddingGemma 2 int8 0.84, keyword 0.76, MiniLM 0.61. EmbeddingGemma 2: 9.8 ms per query, ~490 MB resident while indexing, ~1.1 GB peak on a 2k-token chunk.
+Benchmark: 100 hand-written questions over 26 real meetings (chunk-level MRR@10): Gemini 0.89, EmbeddingGemma 2 int8 0.84, keyword 0.76, MiniLM 0.61. EmbeddingGemma 2: 9.8 ms per query, ~490 MB resident while indexing, ~1.1 GB peak on a 2k-token chunk.
 
 #### The on-device model (EmbeddingGemma 2)
 
